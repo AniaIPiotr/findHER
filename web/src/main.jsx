@@ -1,8 +1,10 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
 import { createRoot } from "react-dom/client";
-import { Plus, X, ArrowRight, LogOut } from "lucide-react";
+import { Plus, X, ArrowRight, LogOut, Check } from "lucide-react";
 import "./App.css";
 import { authApi, createUser } from "./api";
+import Dashboard from "./Dashboard";
+import Explore from "./Explore";
 
 const GOOGLE_CLIENT_ID =
   "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com";
@@ -11,6 +13,33 @@ const GOOGLE_CONFIGURED =
   Boolean(GOOGLE_CLIENT_ID) &&
   !GOOGLE_CLIENT_ID.startsWith("YOUR_") &&
   GOOGLE_CLIENT_ID.endsWith(".apps.googleusercontent.com");
+
+const PREDEFINED_INTERESTS = [
+"cybersecurity",
+  "programming",
+  "data science/AI/ML",
+  "robotics",
+  "web dev",
+  "mobile dev",
+  "databases",
+  "networks",
+  "electronics",
+  "embedded",
+  "biotechnology",
+  "chemistry",
+  "physics",
+  "mathematics",
+  "statistics",
+  "astronomy",
+  "geology",
+  "design",
+  "travel",
+  "art",
+  "music",
+  "books",
+  "movies",
+  "gaming",
+];
 
 function GoogleIcon({ size = 17 }) {
   return (
@@ -36,9 +65,12 @@ function GoogleIcon({ size = 17 }) {
 }
 
 function App() {
+  const [view, setView] = useState("dashboard");
+
   const [form, setForm] = useState({
     firstName: "",
     lastName: "",
+    city: "",
     email: "",
     age: "",
     interest: "",
@@ -70,6 +102,15 @@ function App() {
     }
     setInterests([...interests, interest]);
     setForm({ ...form, interest: "" });
+    setError("");
+  };
+
+  const toggleInterest = (interest) => {
+    setInterests((prev) =>
+      prev.includes(interest)
+        ? prev.filter((item) => item !== interest)
+        : [...prev, interest],
+    );
     setError("");
   };
 
@@ -173,6 +214,7 @@ function App() {
     setForm({
       firstName: "",
       lastName: "",
+      city: "",
       email: "",
       age: "",
       interest: "",
@@ -180,6 +222,7 @@ function App() {
     setInterests([]);
     setError("");
     setSubmitted(false);
+    setView("dashboard");
   };
 
   /* ============================================================
@@ -292,6 +335,7 @@ function App() {
     if (!form.lastName.trim()) return setError("Please enter your last name.");
     if (!nameRegex.test(form.lastName.trim()))
       return setError("Last name can only contain letters.");
+    if (!form.city.trim()) return setError("Please enter your city.");
 
     const age = Number(form.age);
     if (!Number.isInteger(age) || age < 18 || age > 120) {
@@ -309,6 +353,7 @@ function App() {
       const payload = {
         name: form.firstName.trim(),
         surname: form.lastName.trim(),
+        city: form.city.trim(),
         age,
         interests,
       };
@@ -346,6 +391,28 @@ function App() {
     googleUser?.profile_completed ||
     (googleUser?.name && googleUser?.surname && googleUser?.age != null),
   );
+
+  // === EKRAN PO ZALOGOWANIU ===
+if (googleUser && profileCompleted) {
+  if (view === "explore") {
+    return (
+      <Explore
+        user={googleUser}
+        onBack={() => setView("dashboard")}
+        onSignOut={handleGoogleSignOut}
+      />
+    );
+  }
+
+  return (
+    <Dashboard
+      user={googleUser}
+      interests={interests}
+      onSignOut={handleGoogleSignOut}
+      onNavigate={setView}
+    />
+  );
+}
 
   return (
     <main className="page">
@@ -486,6 +553,19 @@ function App() {
                     />
                   </label>
                 </div>
+                <div className="fields-row">
+                  <label>
+                    <span>City</span>
+                    <input
+                      type="text"
+                      name="city"
+                      value={form.city}
+                      onChange={updateField}
+                      placeholder="Warsaw"
+                      autoComplete="address-level2"
+                    />
+                  </label>
+                </div>
 
                 <div className="fields-row">
                   <label>
@@ -519,6 +599,27 @@ function App() {
                   <label>
                     <span>Interests</span>
                   </label>
+
+                  {/* Predefiniowane – klikane chipy */}
+                  <div className="interest-presets">
+                    {PREDEFINED_INTERESTS.map((preset) => {
+                      const active = interests.includes(preset);
+                      return (
+                        <button
+                          type="button"
+                          key={preset}
+                          className={`interest-chip${active ? " interest-chip--active" : ""}`}
+                          onClick={() => toggleInterest(preset)}
+                          aria-pressed={active}
+                        >
+                          {active ? <Check size={13} /> : <Plus size={13} />}
+                          {preset}
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  {/* Własne – input + przycisk Add */}
                   <div className="interest-input">
                     <input
                       type="text"
@@ -531,7 +632,7 @@ function App() {
                           addInterest();
                         }
                       }}
-                      placeholder="e.g. yoga, travel, art"
+                      placeholder="Or add your own…"
                     />
                     <button type="button" onClick={addInterest}>
                       <Plus size={17} />
@@ -539,6 +640,7 @@ function App() {
                     </button>
                   </div>
 
+                  {/* Wybrane – wszystkie (predefiniowane + własne) */}
                   {interests.length > 0 && (
                     <div className="interest-list">
                       {interests.map((interest, index) => (

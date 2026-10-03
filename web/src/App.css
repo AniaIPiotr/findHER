@@ -1040,3 +1040,45 @@ a:focus-visible {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* Predefiniowane zainteresowania */
+.interest-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 6px 0 14px;
+}
+
+.interest-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid #2c2c36;
+  background: #17171d;
+  color: #cfcfd6;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease,
+    transform 0.1s ease;
+}
+
+.interest-chip:hover {
+  border-color: #3a3a46;
+  color: #fff;
+}
+
+.interest-chip:active {
+  transform: scale(0.97);
+}
+
+.interest-chip--active {
+  background: linear-gradient(135deg, #ff5b8a, #b14bff);
+  border-color: transparent;
+  color: #fff;
+  font-weight: 600;
+}

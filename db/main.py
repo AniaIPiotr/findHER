@@ -52,6 +52,7 @@ def init_db():
                 google_sub TEXT UNIQUE,
                 name TEXT,
                 surname TEXT,
+                city TEXT,
                 email TEXT UNIQUE NOT NULL,
                 age INTEGER,
                 interests JSON,
@@ -91,6 +92,7 @@ class GoogleAuthRequest(BaseModel):
 class ProfileIn(BaseModel):
     name: str
     surname: str
+    city: str
     age: int
     interests: list[str]
 
@@ -99,6 +101,7 @@ class UserOut(BaseModel):
     id: int
     name: str | None = None
     surname: str | None = None
+    city: str | None = None
     email: str
     age: int | None = None
     interests: list[str] = []
@@ -296,7 +299,7 @@ def auth_me(request: Request):
     user_id = int(user["sub"])
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, email, name, surname, age, interests FROM users WHERE id = ?",
+            "SELECT id, email, name, surname, city, age, interests FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
     if row is None:
@@ -317,8 +320,8 @@ def add_user(p: ProfileIn, request: Request):
 
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE users SET name=?, surname=?, age=?, interests=? WHERE id=?",
-            (p.name, p.surname, p.age, json.dumps(p.interests), user_id),
+            "UPDATE users SET name=?, surname=?, city=?, age=?, interests=? WHERE id=?",
+            (p.name, p.surname, p.city, p.age, json.dumps(p.interests), user_id),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "User not found")
