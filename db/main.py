@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 import sqlite3
+import json
 
 app = FastAPI()
 DB = "findher.db"
@@ -10,9 +11,17 @@ class UserIn(BaseModel):
     surname: str
     email: str
     age: int
+    interests: list[str]
 
 class UserOut(UserIn):
     id: int
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def parse_interests(cls, v):
+        if isinstance(v, str):
+            return json.loads(v or "[]")
+        return v
 
 conn = sqlite3.connect("findher.db")
 cursor = conn.cursor()
@@ -25,7 +34,8 @@ def init_db():
                 name TEXT NOT NULL,
                 surname TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
-                age INTEGER
+                age INTEGER,
+                interests JSON
             )
         """)
 
@@ -43,8 +53,8 @@ def add_User(p: UserIn):
     with get_conn() as conn:
         try:
             cur = conn.execute(
-                "INSERT INTO users (name, surname, email, age) VALUES (?, ?, ?, ?)",
-                (p.name, p.surname, p.email, p.age)
+                "INSERT INTO users (name, surname, email, age, interests) VALUES (?, ?, ?, ?, ?)",
+                (p.name, p.surname, p.email, p.age, json.dumps(p.interests))
             )
         except sqlite3.IntegrityError:
             raise HTTPException(status_code=400, detail="Email exists")
@@ -55,7 +65,7 @@ def add_User(p: UserIn):
 def list_Users():
     with get_conn() as conn:
         rows = conn.execute("SELECT * FROM users").fetchall()
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
 @app.get("/Users/{User_id}", response_model=UserOut)
@@ -73,8 +83,8 @@ def get_User(User_id: int):
 def update_User(User_id: int, p: UserIn):
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE users SET name=?, surname=?, email=?, age=? WHERE id=?",
-            (p.name, p.surname, p.email, p.age, User_id)
+            "UPDATE users SET name=?, surname=?, email=?, age=?, interests=? WHERE id=?",
+            (p.name, p.surname, p.email, p.age, p.interests, User_id)
         )
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="Not found")
