@@ -3,45 +3,32 @@ import { createRoot } from "react-dom/client";
 import { Plus, X, ArrowRight, LogOut } from "lucide-react";
 import "./App.css";
 
-/* ==================================================================
-   KONFIGURACJA LOGOWANIA GOOGLE
-   ------------------------------------------------------------------
-   1. Wejdź na https://console.cloud.google.com/apis/credentials
-   2. Utwórz "OAuth 2.0 Client ID" → typ "Web application"
-   3. W "Authorized JavaScript origins" dodaj adres aplikacji,
-      np. http://localhost:5173  (bez końcowego slasha)
-   4. Wklej wygenerowany Client ID poniżej (zamiast placeholdera).
-   ================================================================== */
-const GOOGLE_CLIENT_ID = "TWOJ_CLIENT_ID.apps.googleusercontent.com";
+const GOOGLE_CLIENT_ID =
+  "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com";
 
 const GOOGLE_CONFIGURED =
   Boolean(GOOGLE_CLIENT_ID) &&
-  !GOOGLE_CLIENT_ID.startsWith("TWOJ_") &&
+  !GOOGLE_CLIENT_ID.startsWith("YOUR_") &&
   GOOGLE_CLIENT_ID.endsWith(".apps.googleusercontent.com");
 
-/* Dekodowanie payloadu z ID tokena (JWT) zwróconego przez Google.
-   Uwaga: to tylko odczyt danych do UI — w prawdziwej aplikacji
-   token MUSI zostać zweryfikowany po stronie serwera. */
 function decodeJwt(token) {
   try {
     const base64Url = token.split(".")[1];
     const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
     const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-
     const json = decodeURIComponent(
       atob(padded)
         .split("")
         .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
         .join(""),
     );
-
     return JSON.parse(json);
-  } catch {
+  } catch (e) {
+    console.error("[G] decodeJwt failed", e);
     return null;
   }
 }
 
-/* Oficjalne logo Google (używane tylko w widoku "nieskonfigurowane") */
 function GoogleIcon({ size = 17 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 48 48" aria-hidden="true">
@@ -73,12 +60,10 @@ function App() {
     age: "",
     interest: "",
   });
-
   const [interests, setInterests] = useState([]);
   const [error, setError] = useState("");
   const [submitted, setSubmitted] = useState(false);
 
-  /* ---- Google ---- */
   const [googleUser, setGoogleUser] = useState(null);
   const [googleScriptReady, setGoogleScriptReady] = useState(false);
   const googleSlotRef = useRef(null);
@@ -92,12 +77,10 @@ function App() {
   const addInterest = () => {
     const interest = form.interest.trim().toLowerCase();
     if (!interest) return;
-
     if (interests.some((item) => item === interest)) {
-      setError("To zainteresowanie jest już na liście.");
+      setError("This interest is already on the list.");
       return;
     }
-
     setInterests([...interests, interest]);
     setForm({ ...form, interest: "" });
     setError("");
@@ -107,12 +90,15 @@ function App() {
     setInterests(interests.filter((_, i) => i !== index));
   };
 
-  /* ---------------- GOOGLE: obsługa odpowiedzi ---------------- */
   const handleGoogleCredential = useCallback((response) => {
+    console.group("[G] credential callback");
+    console.log("[G] raw response:", response);
     const payload = decodeJwt(response?.credential);
+    console.log("[G] decoded payload:", payload);
+    console.groupEnd();
 
     if (!payload?.email) {
-      setError("Nie udało się zalogować przez Google. Spróbuj ponownie.");
+      setError("Failed to sign in with Google. Please try again.");
       return;
     }
 
@@ -136,103 +122,315 @@ function App() {
   }, []);
 
   const handleGoogleSignOut = () => {
+    console.log("[G] sign out clicked");
     window.google?.accounts?.id?.disableAutoSelect();
     setGoogleUser(null);
-    setForm((prev) => ({
-      ...prev,
-      firstName: "",
-      lastName: "",
-      email: "",
-    }));
+    setForm((prev) => ({ ...prev, firstName: "", lastName: "", email: "" }));
     setError("");
     setSubmitted(false);
   };
 
-  /* ---------------- GOOGLE: ładowanie skryptu GIS ---------------- */
+  /* ============================================================
+     GOOGLE: load GIS script (with polling for API readiness)
+     ============================================================ */
   useEffect(() => {
-    if (!GOOGLE_CONFIGURED) return;
+    console.group("[G] === script-load effect ===");
+    console.log("[G] GOOGLE_CONFIGURED =", GOOGLE_CONFIGURED);
+    console.log("[G] GOOGLE_CLIENT_ID  =", GOOGLE_CLIENT_ID);
+    console.groupEnd();
 
-    if (document.getElementById("google-gsi-client")) {
-      setGoogleScriptReady(true);
+    if (!GOOGLE_CONFIGURED) {
+      console.warn("[G] Google not configured — skipping script load.");
       return;
     }
 
+    let cancelled = false;
+    let pollTimer = null;
+
+    const markReadyWhenApiExists = (label) => {
+      const check = () => {
+        if (cancelled) return;
+        const api = window.google?.accounts?.id;
+        if (api) {
+          console.log(
+            `[G] API ready via ${label}. window.google.accounts.id:`,
+            api,
+          );
+          setGoogleScriptReady(true);
+        } else {
+          console.log(
+            `[G] ${label}: window.google.accounts.id not ready yet, retrying…`,
+          );
+          pollTimer = setTimeout(check, 100);
+        }
+      };
+      check();
+    };
+
+    const existing = document.getElementById("google-gsi-client");
+    if (existing) {
+      console.log("[G] Script tag already in DOM:", existing);
+      console.log(
+        "[G] existing.readyState (non-standard):",
+        existing.readyState,
+      );
+      markReadyWhenApiExists("existing-tag-poll");
+      return () => {
+        cancelled = true;
+        if (pollTimer) clearTimeout(pollTimer);
+      };
+    }
+
+    console.log("[G] Creating <script> for GIS…");
     const script = document.createElement("script");
     script.id = "google-gsi-client";
     script.src = "https://accounts.google.com/gsi/client";
     script.async = true;
     script.defer = true;
-    script.onload = () => setGoogleScriptReady(true);
-    script.onerror = () =>
-      setError("Nie udało się wczytać modułu logowania Google.");
+
+    script.onload = () => {
+      console.log("[G] script.onload fired");
+      console.log("[G] window.google:", window.google);
+      console.log("[G] window.google?.accounts:", window.google?.accounts);
+      console.log(
+        "[G] window.google?.accounts?.id:",
+        window.google?.accounts?.id,
+      );
+      markReadyWhenApiExists("onload-poll");
+    };
+    script.onerror = (e) => {
+      console.error("[G] script.onerror:", e);
+      setError("Failed to load Google sign-in module.");
+    };
 
     document.head.appendChild(script);
+
+    return () => {
+      cancelled = true;
+      if (pollTimer) clearTimeout(pollTimer);
+    };
   }, []);
 
-  /* ---------------- GOOGLE: render przycisku ---------------- */
+  /* ============================================================
+     GOOGLE: render button (with heavy diagnostics)
+     ============================================================ */
   useEffect(() => {
-    if (!googleScriptReady) return;
+    console.group("[G] === render-button effect ===");
+    console.log("[G] googleScriptReady =", googleScriptReady);
+    console.log("[G] googleUser        =", googleUser);
+    console.log(
+      "[G] window.google?.accounts?.id =",
+      window.google?.accounts?.id,
+    );
+
+    if (!googleScriptReady) {
+      console.warn("[G] Not ready yet, bailing.");
+      console.groupEnd();
+      return;
+    }
 
     const container = googleSlotRef.current;
-    if (!container || !window.google?.accounts?.id) return;
+    console.log("[G] container ref:", container);
 
-    window.google.accounts.id.initialize({
-      client_id: GOOGLE_CLIENT_ID,
-      callback: handleGoogleCredential,
-      auto_select: false,
-      cancel_on_tap_outside: true,
-    });
+    if (!container) {
+      console.warn(
+        "[G] googleSlotRef.current is null — the DOM node isn't mounted.",
+      );
+      console.groupEnd();
+      return;
+    }
+    if (!window.google?.accounts?.id) {
+      console.warn("[G] window.google.accounts.id missing at render time.");
+      console.groupEnd();
+      return;
+    }
+
+    const rect = container.getBoundingClientRect();
+    const cs = getComputedStyle(container);
+    console.log("[G] container.getBoundingClientRect():", rect);
+    console.log(
+      "[G] container.offsetWidth / offsetHeight:",
+      container.offsetWidth,
+      container.offsetHeight,
+    );
+    console.log(
+      "[G] container.clientWidth / clientHeight:",
+      container.clientWidth,
+      container.clientHeight,
+    );
+    console.log(
+      "[G] container computed:",
+      "display =",
+      cs.display,
+      "| visibility =",
+      cs.visibility,
+      "| opacity =",
+      cs.opacity,
+      "| width =",
+      cs.width,
+      "| height =",
+      cs.height,
+      "| overflow =",
+      cs.overflow,
+    );
+    console.log("[G] parent element:", container.parentElement);
+    if (container.parentElement) {
+      const pcs = getComputedStyle(container.parentElement);
+      console.log(
+        "[G] parent computed:",
+        "display =",
+        pcs.display,
+        "| visibility =",
+        pcs.visibility,
+        "| opacity =",
+        pcs.opacity,
+        "| width =",
+        pcs.width,
+        "| height =",
+        pcs.height,
+      );
+    }
+
+    console.log("[G] Calling initialize() with client_id:", GOOGLE_CLIENT_ID);
+    try {
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleGoogleCredential,
+        auto_select: false,
+        cancel_on_tap_outside: true,
+      });
+      console.log("[G] initialize() completed without throwing.");
+    } catch (e) {
+      console.error("[G] initialize() threw:", e);
+    }
 
     const width = Math.min(
       400,
       Math.max(240, Math.round(container.offsetWidth || 340)),
     );
+    console.log("[G] computed button width =", width);
 
     container.innerHTML = "";
-    window.google.accounts.id.renderButton(container, {
-      type: "standard",
-      theme: "filled_black",
-      size: "large",
-      text: "continue_with",
-      shape: "pill",
-      logo_alignment: "center",
-      width,
-    });
+    console.log(
+      "[G] cleared container. innerHTML now:",
+      JSON.stringify(container.innerHTML),
+    );
+
+    try {
+      window.google.accounts.id.renderButton(container, {
+        type: "standard",
+        theme: "filled_black",
+        size: "large",
+        text: "continue_with",
+        shape: "pill",
+        logo_alignment: "center",
+        width,
+      });
+      console.log("[G] renderButton() returned.");
+    } catch (e) {
+      console.error("[G] renderButton() threw:", e);
+    }
+
+    /* --- Post-render inspection --- */
+    const inspect = (delay) => {
+      setTimeout(() => {
+        console.group(`[G] --- post-render inspect (+${delay}ms) ---`);
+        console.log(
+          "[G] container.childNodes.length:",
+          container.childNodes.length,
+        );
+        console.log(
+          "[G] container.children.length:  ",
+          container.children.length,
+        );
+        console.log(
+          "[G] container.innerHTML length: ",
+          container.innerHTML.length,
+        );
+        console.log(
+          "[G] container.innerHTML (first 400 chars):",
+          container.innerHTML.slice(0, 400),
+        );
+
+        const iframe = container.querySelector("iframe");
+        console.log("[G] iframe in container:", iframe);
+        if (iframe) {
+          const irect = iframe.getBoundingClientRect();
+          const ics = getComputedStyle(iframe);
+          console.log("[G] iframe rect:", irect);
+          console.log(
+            "[G] iframe computed:",
+            "display =",
+            ics.display,
+            "| visibility =",
+            ics.visibility,
+            "| opacity =",
+            ics.opacity,
+            "| width =",
+            ics.width,
+            "| height =",
+            ics.height,
+          );
+          console.log("[G] iframe src:", iframe.src);
+        }
+
+        const inner = container.querySelector("div");
+        if (inner) {
+          const idiv = inner.getBoundingClientRect();
+          const ics = getComputedStyle(inner);
+          console.log("[G] inner div rect:", idiv);
+          console.log(
+            "[G] inner div computed:",
+            "display =",
+            ics.display,
+            "| visibility =",
+            ics.visibility,
+            "| opacity =",
+            ics.opacity,
+            "| width =",
+            ics.width,
+            "| height =",
+            ics.height,
+          );
+        }
+
+        console.log(
+          "[G] container rect after render:",
+          container.getBoundingClientRect(),
+        );
+        console.groupEnd();
+      }, delay);
+    };
+    inspect(50);
+    inspect(300);
+    inspect(1000);
+
+    console.groupEnd();
   }, [googleScriptReady, googleUser, handleGoogleCredential]);
 
-  /* ---------------- Submit ---------------- */
   const handleSubmit = (e) => {
     e.preventDefault();
-
     const nameRegex = /^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż ]+$/;
 
-    if (!form.firstName.trim()) return setError("Podaj imię.");
-    if (!nameRegex.test(form.firstName.trim())) {
-      return setError("Imię może zawierać tylko litery alfabetu.");
-    }
-
-    if (!form.lastName.trim()) return setError("Podaj nazwisko.");
-    if (!nameRegex.test(form.lastName.trim())) {
-      return setError("Nazwisko może zawierać tylko litery alfabetu.");
-    }
-
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email)) {
-      return setError("Podaj prawidłowy adres e-mail.");
-    }
+    if (!form.firstName.trim())
+      return setError("Please enter your first name.");
+    if (!nameRegex.test(form.firstName.trim()))
+      return setError("First name can only contain letters.");
+    if (!form.lastName.trim()) return setError("Please enter your last name.");
+    if (!nameRegex.test(form.lastName.trim()))
+      return setError("Last name can only contain letters.");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email))
+      return setError("Please enter a valid email address.");
 
     const age = Number(form.age);
     if (!Number.isInteger(age) || age < 18 || age > 120) {
-      return setError("Musisz mieć ukończone 18 lat, aby dołączyć.");
+      return setError("You must be at least 18 years old to join.");
     }
-
-    if (!interests.length) {
-      return setError("Dodaj przynajmniej jedno zainteresowanie.");
-    }
+    if (!interests.length) return setError("Add at least one interest.");
 
     setError("");
     setSubmitted(true);
-
-    console.log({
+    console.log("[submit] payload:", {
       firstName: form.firstName,
       lastName: form.lastName,
       email: form.email,
@@ -259,23 +457,19 @@ function App() {
             <div className="logo-mark">FH</div>
             <span>findHER</span>
           </div>
-
           <div className="intro-content">
             <p className="eyebrow">FIND YOUR CIRCLE</p>
-
             <h1>
               Meet women
               <br />
               who get you.
             </h1>
-
             <p className="intro-text">
               findHER connects you with inspiring women near you — for
               friendship, collaboration, or something more. Share a few things
               about yourself and start discovering your people.
             </p>
           </div>
-
           <div className="intro-footer">
             <div className="avatar">FH</div>
             <div>
@@ -301,14 +495,12 @@ function App() {
             </header>
 
             {error && <div className="error-message">{error}</div>}
-
             {submitted && (
               <div className="success-message">
-                Witaj w findHER! Twój profil został utworzony.
+                Welcome to findHER! Your profile has been created.
               </div>
             )}
 
-            {/* ---------------- GOOGLE AUTH ---------------- */}
             <div className="google-auth">
               {googleUser ? (
                 <div className="google-account">
@@ -324,33 +516,35 @@ function App() {
                       {initials}
                     </div>
                   )}
-
                   <div className="google-account-info">
                     <strong>{googleUser.name}</strong>
                     <span>{googleUser.email}</span>
                   </div>
-
                   <button
                     type="button"
                     className="google-signout"
                     onClick={handleGoogleSignOut}
-                    aria-label="Wyloguj z Google"
-                    title="Wyloguj z Google"
+                    aria-label="Sign out of Google"
+                    title="Sign out of Google"
                   >
                     <LogOut size={15} />
                   </button>
                 </div>
               ) : GOOGLE_CONFIGURED ? (
-                <div className="google-slot" ref={googleSlotRef} />
+                <div
+                  className="google-slot"
+                  ref={googleSlotRef}
+                  style={{ minHeight: 44, minWidth: 240 }}
+                />
               ) : (
                 <>
                   <button type="button" className="google-placeholder" disabled>
                     <GoogleIcon />
-                    Kontynuuj z Google
+                    Continue with Google
                   </button>
                   <p className="google-hint">
-                    Ustaw <code>GOOGLE_CLIENT_ID</code> w <code>main.jsx</code>,
-                    aby włączyć logowanie Google.
+                    Set <code>GOOGLE_CLIENT_ID</code> in <code>main.jsx</code>{" "}
+                    to enable Google sign-in.
                   </p>
                 </>
               )}
@@ -358,30 +552,29 @@ function App() {
 
             {!googleUser && (
               <div className="auth-divider">
-                <span>lub</span>
+                <span>or</span>
               </div>
             )}
 
             <form onSubmit={handleSubmit}>
               <div className="fields-row">
                 <label>
-                  <span>Imię</span>
+                  <span>First name</span>
                   <input
                     name="firstName"
                     value={form.firstName}
                     onChange={updateField}
-                    placeholder="Anna"
+                    placeholder="Jane"
                     autoComplete="given-name"
                   />
                 </label>
-
                 <label>
-                  <span>Nazwisko</span>
+                  <span>Last name</span>
                   <input
                     name="lastName"
                     value={form.lastName}
                     onChange={updateField}
-                    placeholder="Kowalska"
+                    placeholder="Doe"
                     autoComplete="family-name"
                   />
                 </label>
@@ -390,24 +583,21 @@ function App() {
               <div className="fields-row">
                 <label>
                   <span>
-                    E-mail
-                    {googleUser && (
-                      <em className="verified-badge">zweryfikowany</em>
-                    )}
+                    Email
+                    {googleUser && <em className="verified-badge">verified</em>}
                   </span>
                   <input
                     type="email"
                     name="email"
                     value={form.email}
                     onChange={updateField}
-                    placeholder="anna@example.com"
+                    placeholder="jane@example.com"
                     autoComplete="email"
                     readOnly={Boolean(googleUser)}
                   />
                 </label>
-
                 <label>
-                  <span>Wiek</span>
+                  <span>Age</span>
                   <input
                     type="number"
                     name="age"
@@ -422,9 +612,8 @@ function App() {
 
               <div className="interests">
                 <label>
-                  <span>Zainteresowania</span>
+                  <span>Interests</span>
                 </label>
-
                 <div className="interest-input">
                   <input
                     type="text"
@@ -437,12 +626,11 @@ function App() {
                         addInterest();
                       }
                     }}
-                    placeholder="np. joga, podróże, sztuka"
+                    placeholder="e.g. yoga, travel, art"
                   />
-
                   <button type="button" onClick={addInterest}>
                     <Plus size={17} />
-                    Dodaj
+                    Add
                   </button>
                 </div>
 
@@ -454,7 +642,7 @@ function App() {
                         <button
                           type="button"
                           onClick={() => removeInterest(index)}
-                          aria-label={`Usuń ${interest}`}
+                          aria-label={`Remove ${interest}`}
                         >
                           <X size={13} />
                         </button>
@@ -465,13 +653,13 @@ function App() {
               </div>
 
               <button className="submit-button" type="submit">
-                Dołącz do findHER
+                Join findHER
                 <ArrowRight size={18} />
               </button>
             </form>
 
             <p className="login">
-              Masz już konto? <a href="#login">Zaloguj się</a>
+              Already have an account? <a href="#login">Log in</a>
             </p>
           </div>
         </section>
