@@ -136,6 +136,15 @@ button {
   }
 }
 
+@keyframes sweep {
+  from {
+    left: -60%;
+  }
+  to {
+    left: 130%;
+  }
+}
+
 /* ============================================================
    PAGE / AMBIENT BACKGROUND
    ============================================================ */
@@ -149,7 +158,6 @@ button {
   overflow: hidden;
 }
 
-/* faint engineering grid */
 .page::before {
   content: "";
   position: fixed;
@@ -172,7 +180,6 @@ button {
   pointer-events: none;
 }
 
-/* drifting aurora glow */
 .page::after {
   content: "";
   position: fixed;
@@ -226,7 +233,6 @@ button {
   animation: rise 0.85s var(--ease) both;
 }
 
-/* neon gradient hairline border */
 .register-container::before {
   content: "";
   position: absolute;
@@ -275,7 +281,6 @@ button {
   z-index: 1;
 }
 
-/* grid texture inside the panel */
 .intro::before {
   content: "";
   position: absolute;
@@ -289,7 +294,6 @@ button {
   pointer-events: none;
 }
 
-/* corner glow orb */
 .intro::after {
   content: "";
   position: absolute;
@@ -545,7 +549,6 @@ input:-webkit-autofill:focus {
   transition: background-color 9999s ease-in-out 0s;
 }
 
-/* remove number spinners */
 input[type="number"]::-webkit-outer-spin-button,
 input[type="number"]::-webkit-inner-spin-button {
   -webkit-appearance: none;
@@ -742,15 +745,6 @@ input[type="number"] {
   transform: translateY(0);
 }
 
-@keyframes sweep {
-  from {
-    left: -60%;
-  }
-  to {
-    left: 130%;
-  }
-}
-
 /* ---------- Footer link ---------- */
 .login {
   margin: 22px 0 0;
@@ -782,6 +776,192 @@ button:focus-visible,
 a:focus-visible {
   outline: 2px solid rgba(34, 211, 238, 0.8);
   outline-offset: 2px;
+}
+
+/* ============================================================
+   GOOGLE AUTH
+   ============================================================
+   UWAGA: NIE nadpisujemy stylów wewnątrz .google-slot (!important
+   na iframe/div psuje layout generowany przez Google Identity Services).
+   Stylujemy tylko nasze własne kontenery.
+   ============================================================ */
+
+.google-auth {
+  width: 100%;
+  margin: 0 0 4px 0;
+}
+
+/* Slot pod przycisk Google — dajemy mu miejsce, resztą zajmuje się GSI */
+.google-slot {
+  width: 100%;
+  min-height: 44px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+/* Delikatny safety-net: tylko max-width, bez position/display */
+.google-slot > * {
+  max-width: 100%;
+}
+
+/* Tekst zachęty przed przyciskiem */
+.google-required-text {
+  margin: 0 0 12px;
+  font-size: 12.5px;
+  color: var(--muted);
+  text-align: center;
+  letter-spacing: 0.01em;
+}
+
+/* Stan ładowania (sprawdzanie sesji) */
+.google-loading {
+  padding: 12px 0;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--muted-dim);
+  font-family: "JetBrains Mono", monospace;
+  letter-spacing: 0.1em;
+}
+
+/* Karta zalogowanego użytkownika */
+.google-account {
+  display: grid;
+  grid-template-columns: 36px minmax(0, 1fr) 28px;
+  align-items: center;
+  column-gap: 12px;
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid rgba(52, 211, 153, 0.32);
+  border-radius: 14px;
+  background: rgba(52, 211, 153, 0.07);
+  box-shadow: 0 0 30px -16px rgba(52, 211, 153, 0.9);
+}
+
+.google-avatar {
+  display: block;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  object-fit: cover;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
+}
+.google-avatar--fallback {
+  display: grid;
+  place-items: center;
+  background: var(--grad);
+  color: #05060a;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.google-account-info {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.google-account-info strong,
+.google-account-info span {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.google-account-info strong {
+  font-size: 13.5px;
+  color: #eaf3ff;
+}
+.google-account-info span {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.google-signout {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--muted);
+  transition:
+    color 0.18s,
+    background 0.18s,
+    border-color 0.18s;
+}
+.google-signout:hover {
+  color: #ffb3bf;
+  border-color: rgba(255, 90, 110, 0.4);
+  background: rgba(255, 90, 110, 0.12);
+}
+
+/* Placeholder gdy Google nieskonfigurowane */
+.google-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  height: 48px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.035);
+  color: var(--muted);
+  font-size: 13.5px;
+  font-weight: 500;
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.google-hint {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--muted-dim);
+  text-align: center;
+}
+.google-hint code {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  color: var(--cyan);
+  background: rgba(34, 211, 238, 0.08);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+/* Separator "or" */
+.auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px 0;
+  color: var(--muted-dim);
+  font-size: 11px;
+  font-family: "JetBrains Mono", monospace;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.auth-divider::before,
+.auth-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* Badge "verified" */
+.verified-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-style: normal;
+  font-family: "JetBrains Mono", monospace;
+  letter-spacing: 0.12em;
+  color: #74ecb8;
+  background: rgba(52, 211, 153, 0.12);
+  border: 1px solid rgba(52, 211, 153, 0.3);
+  border-radius: 4px;
 }
 
 /* ============================================================
@@ -859,331 +1039,4 @@ a:focus-visible {
     animation-iteration-count: 1 !important;
     transition-duration: 0.001ms !important;
   }
-}
-/* Wrapper: czysty flex, bez sztywnych wymiarów — rośnie z dziećmi */
-.google-auth {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  width: 100%;
-  height: auto;
-  min-height: 0; /* kluczowe: bez tego zostaje 44px od buttona */
-  align-items: stretch;
-  overflow: visible;
-}
-
-/* Każde dziecko wypełnia szerokość i samo decyduje o wysokości */
-.google-auth > * {
-  width: 100%;
-  height: auto;
-  flex: 0 0 auto;
-}
-
-/* Slot tylko dla przycisku Google (przed logowaniem) */
-.google-slot {
-  width: 100%;
-  min-height: 44px;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  overflow: visible;
-}
-
-.google-slot > div,
-.google-slot iframe {
-  display: block !important;
-  visibility: visible !important;
-  opacity: 1 !important;
-  max-width: 100%;
-}
-
-/* Karta zalogowanego użytkownika — naturalna wysokość */
-.google-account {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
-  border: 1px solid rgba(52, 211, 153, 0.32);
-  border-radius: 14px;
-  background: rgba(52, 211, 153, 0.07);
-  box-shadow: 0 0 30px -16px rgba(52, 211, 153, 0.9);
-  height: auto;
-  min-height: 0;
-  overflow: visible;
-}
-
-/* Awatar i przycisk wylogowania — nie pozwól im się ściskać */
-.google-avatar,
-.google-avatar--fallback {
-  flex: 0 0 auto;
-}
-.google-avatar {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  object-fit: cover;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15);
-}
-.google-avatar--fallback {
-  display: grid;
-  place-items: center;
-  background: var(--grad);
-  color: #05060a;
-  font-size: 12px;
-  font-weight: 700;
-}
-
-.google-account-info {
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  flex: 1 1 auto;
-}
-.google-account-info strong {
-  font-size: 13.5px;
-  color: #eaf3ff;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.google-account-info span {
-  font-size: 11.5px;
-  color: var(--muted);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.google-signout {
-  flex: 0 0 auto; /* nie kurczy się przy długim e-mailu */
-  width: 28px;
-  height: 28px;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.04);
-  color: var(--muted);
-  transition:
-    color 0.18s,
-    background 0.18s,
-    border-color 0.18s;
-}
-.google-signout:hover {
-  color: #ffb3bf;
-  border-color: rgba(255, 90, 110, 0.4);
-  background: rgba(255, 90, 110, 0.12);
-}
-/* ============================================================
-   GOOGLE AUTH — wersja pancerna
-   ============================================================ */
-
-/* DEBUG: obramowanie pokazuje realne granice kontenerów.
-   USUŃ te dwa `outline` po zdiagnozowaniu problemu. */
-
-.google-auth {
-  display: block !important; /* blok, nie flex — brak niespodzianek */
-  width: 100% !important;
-  height: auto !important;
-  min-height: 0 !important;
-  max-height: none !important;
-  padding: 0 !important;
-  margin: 0 0 4px 0 !important;
-  overflow: visible !important;
-  position: static !important;
-  transform: none !important;
-  contain: none !important;
-  box-sizing: border-box !important;
-}
-
-.google-auth > * {
-  width: 100% !important;
-  height: auto !important;
-  margin: 0 !important;
-  box-sizing: border-box !important;
-}
-
-/* Slot pod przycisk Google (przed logowaniem) */
-.google-slot {
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  width: 100% !important;
-  min-height: 44px !important;
-  overflow: visible !important;
-}
-.google-slot > div,
-.google-slot iframe {
-  display: block !important;
-  visibility: visible !important;
-  opacity: 1 !important;
-  max-width: 100% !important;
-  position: static !important;
-}
-
-/* Karta zalogowanego użytkownika — GRID, nie flex.
-   Grid nie ma problemu z `min-width: auto` na dzieciach. */
-.google-account {
-  display: grid !important;
-  grid-template-columns: 36px minmax(0, 1fr) 28px !important;
-  align-items: center !important;
-  column-gap: 12px !important;
-  padding: 10px 12px !important;
-  width: 100% !important;
-  height: auto !important;
-  min-height: 0 !important;
-  border: 1px solid rgba(52, 211, 153, 0.32) !important;
-  border-radius: 14px !important;
-  background: rgba(52, 211, 153, 0.07) !important;
-  box-shadow: 0 0 30px -16px rgba(52, 211, 153, 0.9) !important;
-  overflow: visible !important;
-  position: static !important;
-  transform: none !important;
-}
-
-/* Awatar */
-.google-avatar {
-  display: block !important;
-  width: 36px !important;
-  height: 36px !important;
-  min-width: 36px !important;
-  border-radius: 50% !important;
-  object-fit: cover !important;
-  position: static !important;
-  grid-column: 1 !important;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.15) !important;
-}
-.google-avatar--fallback {
-  display: grid !important;
-  place-items: center !important;
-  background: var(--grad) !important;
-  color: #05060a !important;
-  font-size: 12px !important;
-  font-weight: 700 !important;
-}
-
-/* Środek — imię + email */
-.google-account-info {
-  display: flex !important;
-  flex-direction: column !important;
-  min-width: 0 !important;
-  width: 100% !important;
-  grid-column: 2 !important;
-  overflow: hidden !important;
-  position: static !important;
-}
-.google-account-info strong,
-.google-account-info span {
-  display: block !important; /* kluczowe dla ellipsis */
-  white-space: nowrap !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-  max-width: 100% !important;
-  position: static !important;
-}
-.google-account-info strong {
-  font-size: 13.5px !important;
-  color: #eaf3ff !important;
-}
-.google-account-info span {
-  font-size: 11.5px !important;
-  color: var(--muted) !important;
-}
-
-/* Przycisk sign-out */
-.google-signout {
-  display: grid !important;
-  place-items: center !important;
-  width: 28px !important;
-  height: 28px !important;
-  min-width: 28px !important;
-  flex: none !important;
-  border: 1px solid var(--line) !important;
-  border-radius: 8px !important;
-  background: rgba(255, 255, 255, 0.04) !important;
-  color: var(--muted) !important;
-  position: static !important;
-  grid-column: 3 !important;
-  transition:
-    color 0.18s,
-    background 0.18s,
-    border-color 0.18s !important;
-}
-.google-signout:hover {
-  color: #ffb3bf !important;
-  border-color: rgba(255, 90, 110, 0.4) !important;
-  background: rgba(255, 90, 110, 0.12) !important;
-}
-.google-signout svg {
-  width: 15px !important;
-  height: 15px !important;
-  position: static !important;
-}
-
-/* Placeholder gdy Google nieskonfigurowane */
-.google-placeholder {
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
-  gap: 10px !important;
-  width: 100% !important;
-  height: 48px !important;
-  border: 1px solid var(--line) !important;
-  border-radius: 999px !important;
-  background: rgba(255, 255, 255, 0.035) !important;
-  color: var(--muted) !important;
-  font-size: 13.5px !important;
-  font-weight: 500 !important;
-  opacity: 0.65 !important;
-  cursor: not-allowed !important;
-}
-
-.google-hint {
-  margin: 8px 0 0 !important;
-  font-size: 11px !important;
-  color: var(--muted-dim) !important;
-  text-align: center !important;
-}
-.google-hint code {
-  font-family: "JetBrains Mono", monospace !important;
-  font-size: 10.5px !important;
-  color: var(--cyan) !important;
-  background: rgba(34, 211, 238, 0.08) !important;
-  padding: 1px 5px !important;
-  border-radius: 4px !important;
-}
-
-/* Separator "or" */
-.auth-divider {
-  display: flex !important;
-  align-items: center !important;
-  gap: 12px !important;
-  margin: 18px 0 !important;
-  color: var(--muted-dim) !important;
-  font-size: 11px !important;
-  font-family: "JetBrains Mono", monospace !important;
-  letter-spacing: 0.18em !important;
-  text-transform: uppercase !important;
-}
-.auth-divider::before,
-.auth-divider::after {
-  content: "" !important;
-  flex: 1 !important;
-  height: 1px !important;
-  background: var(--line) !important;
-}
-
-/* Badge "verified" */
-.verified-badge {
-  display: inline-block !important;
-  margin-left: 8px !important;
-  padding: 1px 6px !important;
-  font-size: 9px !important;
-  font-style: normal !important;
-  font-family: "JetBrains Mono", monospace !important;
-  letter-spacing: 0.12em !important;
-  color: #74ecb8 !important;
-  background: rgba(52, 211, 153, 0.12) !important;
-  border: 1px solid rgba(52, 211, 153, 0.3) !important;
-  border-radius: 4px !important;
 }

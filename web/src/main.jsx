@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import { Plus, X, ArrowRight, LogOut } from "lucide-react";
 import "./App.css";
+import { authApi, createUser } from "./api";
 
 const GOOGLE_CLIENT_ID =
   "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com";
@@ -10,24 +11,6 @@ const GOOGLE_CONFIGURED =
   Boolean(GOOGLE_CLIENT_ID) &&
   !GOOGLE_CLIENT_ID.startsWith("YOUR_") &&
   GOOGLE_CLIENT_ID.endsWith(".apps.googleusercontent.com");
-
-function decodeJwt(token) {
-  try {
-    const base64Url = token.split(".")[1];
-    const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-    const json = decodeURIComponent(
-      atob(padded)
-        .split("")
-        .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-        .join(""),
-    );
-    return JSON.parse(json);
-  } catch (e) {
-    console.error("[G] decodeJwt failed", e);
-    return null;
-  }
-}
 
 function GoogleIcon({ size = 17 }) {
   return (
@@ -63,10 +46,14 @@ function App() {
   const [interests, setInterests] = useState([]);
   const [error, setError] = useState("");
   const [submitted, setSubmitted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
 
-  const [googleUser, setGoogleUser] = useState(null);
+  // auth: { loading, user }
+  const [auth, setAuth] = useState({ loading: true, user: null });
   const [googleScriptReady, setGoogleScriptReady] = useState(false);
   const googleSlotRef = useRef(null);
+
+  const googleUser = auth.user;
 
   const updateField = (e) => {
     setForm({ ...form, [e.target.name]: e.target.value });
@@ -90,77 +77,127 @@ function App() {
     setInterests(interests.filter((_, i) => i !== index));
   };
 
-  const handleGoogleCredential = useCallback((response) => {
-    console.group("[G] credential callback");
-    console.log("[G] raw response:", response);
-    const payload = decodeJwt(response?.credential);
-    console.log("[G] decoded payload:", payload);
-    console.groupEnd();
+  /* ============================================================
+     AUTH: sprawdź sesję przy starcie (httpOnly cookie)
+     ============================================================ */
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await authApi.me();
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.authenticated) {
+          setAuth({ loading: false, user: data.user });
+          setForm((prev) => ({ ...prev, email: data.user.email }));
+          if (data.user.name) {
+            setForm((prev) => ({
+              ...prev,
+              firstName: data.user.name || "",
+              lastName: data.user.surname || "",
+              age: data.user.age != null ? String(data.user.age) : "",
+            }));
+          }
+          if (Array.isArray(data.user.interests)) {
+            setInterests(data.user.interests);
+          }
+          if (data.user.profile_completed) {
+            setSubmitted(true);
+          }
+        } else {
+          setAuth({ loading: false, user: null });
+        }
+      } catch (e) {
+        console.error("[auth/me] failed", e);
+        if (!cancelled) setAuth({ loading: false, user: null });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
-    if (!payload?.email) {
+  /* ============================================================
+     GOOGLE: callback – wyślij credential do backendu
+     ============================================================ */
+  const handleGoogleCredential = useCallback(async (response) => {
+    const credential = response?.credential;
+    if (!credential) {
       setError("Failed to sign in with Google. Please try again.");
       return;
     }
 
-    setGoogleUser({
-      sub: payload.sub,
-      name: payload.name || payload.email,
-      email: payload.email,
-      picture: payload.picture || "",
-      emailVerified: payload.email_verified,
-    });
+    try {
+      const res = await authApi.google(credential);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Google sign-in failed");
+      }
 
-    setForm((prev) => ({
-      ...prev,
-      firstName: payload.given_name || prev.firstName,
-      lastName: payload.family_name || prev.lastName,
-      email: payload.email,
-    }));
+      const meRes = await authApi.me();
+      const me = await meRes.json();
+      if (!me.authenticated) {
+        throw new Error("Session could not be established.");
+      }
 
-    setError("");
-    setSubmitted(false);
+      setAuth({ loading: false, user: me.user });
+      setForm((prev) => ({
+        ...prev,
+        email: me.user.email,
+        firstName: me.user.name || prev.firstName,
+        lastName: me.user.surname || prev.lastName,
+        age: me.user.age != null ? String(me.user.age) : prev.age,
+      }));
+      if (Array.isArray(me.user.interests) && me.user.interests.length) {
+        setInterests(me.user.interests);
+      }
+      if (me.user.profile_completed) {
+        setSubmitted(true);
+      }
+
+      setError("");
+    } catch (e) {
+      console.error("[google auth] failed", e);
+      setError(e.message || "Something went wrong.");
+    }
   }, []);
 
-  const handleGoogleSignOut = () => {
-    console.log("[G] sign out clicked");
+  const handleGoogleSignOut = async () => {
+    try {
+      await authApi.logout();
+    } catch (e) {
+      console.error("[logout] failed", e);
+    }
     window.google?.accounts?.id?.disableAutoSelect();
-    setGoogleUser(null);
-    setForm((prev) => ({ ...prev, firstName: "", lastName: "", email: "" }));
+    setAuth({ loading: false, user: null });
+    setForm({
+      firstName: "",
+      lastName: "",
+      email: "",
+      age: "",
+      interest: "",
+    });
+    setInterests([]);
     setError("");
     setSubmitted(false);
   };
 
   /* ============================================================
-     GOOGLE: load GIS script (with polling for API readiness)
+     GOOGLE: load GIS script
      ============================================================ */
   useEffect(() => {
-    console.group("[G] === script-load effect ===");
-    console.log("[G] GOOGLE_CONFIGURED =", GOOGLE_CONFIGURED);
-    console.log("[G] GOOGLE_CLIENT_ID  =", GOOGLE_CLIENT_ID);
-    console.groupEnd();
-
-    if (!GOOGLE_CONFIGURED) {
-      console.warn("[G] Google not configured — skipping script load.");
-      return;
-    }
+    if (!GOOGLE_CONFIGURED) return;
 
     let cancelled = false;
     let pollTimer = null;
 
-    const markReadyWhenApiExists = (label) => {
+    const markReadyWhenApiExists = () => {
       const check = () => {
         if (cancelled) return;
         const api = window.google?.accounts?.id;
         if (api) {
-          console.log(
-            `[G] API ready via ${label}. window.google.accounts.id:`,
-            api,
-          );
           setGoogleScriptReady(true);
         } else {
-          console.log(
-            `[G] ${label}: window.google.accounts.id not ready yet, retrying…`,
-          );
           pollTimer = setTimeout(check, 100);
         }
       };
@@ -169,39 +206,21 @@ function App() {
 
     const existing = document.getElementById("google-gsi-client");
     if (existing) {
-      console.log("[G] Script tag already in DOM:", existing);
-      console.log(
-        "[G] existing.readyState (non-standard):",
-        existing.readyState,
-      );
-      markReadyWhenApiExists("existing-tag-poll");
+      markReadyWhenApiExists();
       return () => {
         cancelled = true;
         if (pollTimer) clearTimeout(pollTimer);
       };
     }
 
-    console.log("[G] Creating <script> for GIS…");
     const script = document.createElement("script");
     script.id = "google-gsi-client";
     script.src = "https://accounts.google.com/gsi/client";
     script.async = true;
     script.defer = true;
 
-    script.onload = () => {
-      console.log("[G] script.onload fired");
-      console.log("[G] window.google:", window.google);
-      console.log("[G] window.google?.accounts:", window.google?.accounts);
-      console.log(
-        "[G] window.google?.accounts?.id:",
-        window.google?.accounts?.id,
-      );
-      markReadyWhenApiExists("onload-poll");
-    };
-    script.onerror = (e) => {
-      console.error("[G] script.onerror:", e);
-      setError("Failed to load Google sign-in module.");
-    };
+    script.onload = () => markReadyWhenApiExists();
+    script.onerror = () => setError("Failed to load Google sign-in module.");
 
     document.head.appendChild(script);
 
@@ -212,86 +231,15 @@ function App() {
   }, []);
 
   /* ============================================================
-     GOOGLE: render button (with heavy diagnostics)
+     GOOGLE: render button
      ============================================================ */
   useEffect(() => {
-    console.group("[G] === render-button effect ===");
-    console.log("[G] googleScriptReady =", googleScriptReady);
-    console.log("[G] googleUser        =", googleUser);
-    console.log(
-      "[G] window.google?.accounts?.id =",
-      window.google?.accounts?.id,
-    );
-
-    if (!googleScriptReady) {
-      console.warn("[G] Not ready yet, bailing.");
-      console.groupEnd();
-      return;
-    }
-
+    if (!googleScriptReady) return;
+    if (googleUser) return; // już zalogowany – nie renderujemy przycisku
     const container = googleSlotRef.current;
-    console.log("[G] container ref:", container);
+    if (!container) return;
+    if (!window.google?.accounts?.id) return;
 
-    if (!container) {
-      console.warn(
-        "[G] googleSlotRef.current is null — the DOM node isn't mounted.",
-      );
-      console.groupEnd();
-      return;
-    }
-    if (!window.google?.accounts?.id) {
-      console.warn("[G] window.google.accounts.id missing at render time.");
-      console.groupEnd();
-      return;
-    }
-
-    const rect = container.getBoundingClientRect();
-    const cs = getComputedStyle(container);
-    console.log("[G] container.getBoundingClientRect():", rect);
-    console.log(
-      "[G] container.offsetWidth / offsetHeight:",
-      container.offsetWidth,
-      container.offsetHeight,
-    );
-    console.log(
-      "[G] container.clientWidth / clientHeight:",
-      container.clientWidth,
-      container.clientHeight,
-    );
-    console.log(
-      "[G] container computed:",
-      "display =",
-      cs.display,
-      "| visibility =",
-      cs.visibility,
-      "| opacity =",
-      cs.opacity,
-      "| width =",
-      cs.width,
-      "| height =",
-      cs.height,
-      "| overflow =",
-      cs.overflow,
-    );
-    console.log("[G] parent element:", container.parentElement);
-    if (container.parentElement) {
-      const pcs = getComputedStyle(container.parentElement);
-      console.log(
-        "[G] parent computed:",
-        "display =",
-        pcs.display,
-        "| visibility =",
-        pcs.visibility,
-        "| opacity =",
-        pcs.opacity,
-        "| width =",
-        pcs.width,
-        "| height =",
-        pcs.height,
-      );
-    }
-
-    console.log("[G] Calling initialize() with client_id:", GOOGLE_CLIENT_ID);
     try {
       window.google.accounts.id.initialize({
         client_id: GOOGLE_CLIENT_ID,
@@ -299,7 +247,6 @@ function App() {
         auto_select: false,
         cancel_on_tap_outside: true,
       });
-      console.log("[G] initialize() completed without throwing.");
     } catch (e) {
       console.error("[G] initialize() threw:", e);
     }
@@ -308,14 +255,8 @@ function App() {
       400,
       Math.max(240, Math.round(container.offsetWidth || 340)),
     );
-    console.log("[G] computed button width =", width);
 
     container.innerHTML = "";
-    console.log(
-      "[G] cleared container. innerHTML now:",
-      JSON.stringify(container.innerHTML),
-    );
-
     try {
       window.google.accounts.id.renderButton(container, {
         type: "standard",
@@ -326,90 +267,22 @@ function App() {
         logo_alignment: "center",
         width,
       });
-      console.log("[G] renderButton() returned.");
     } catch (e) {
       console.error("[G] renderButton() threw:", e);
     }
-
-    /* --- Post-render inspection --- */
-    const inspect = (delay) => {
-      setTimeout(() => {
-        console.group(`[G] --- post-render inspect (+${delay}ms) ---`);
-        console.log(
-          "[G] container.childNodes.length:",
-          container.childNodes.length,
-        );
-        console.log(
-          "[G] container.children.length:  ",
-          container.children.length,
-        );
-        console.log(
-          "[G] container.innerHTML length: ",
-          container.innerHTML.length,
-        );
-        console.log(
-          "[G] container.innerHTML (first 400 chars):",
-          container.innerHTML.slice(0, 400),
-        );
-
-        const iframe = container.querySelector("iframe");
-        console.log("[G] iframe in container:", iframe);
-        if (iframe) {
-          const irect = iframe.getBoundingClientRect();
-          const ics = getComputedStyle(iframe);
-          console.log("[G] iframe rect:", irect);
-          console.log(
-            "[G] iframe computed:",
-            "display =",
-            ics.display,
-            "| visibility =",
-            ics.visibility,
-            "| opacity =",
-            ics.opacity,
-            "| width =",
-            ics.width,
-            "| height =",
-            ics.height,
-          );
-          console.log("[G] iframe src:", iframe.src);
-        }
-
-        const inner = container.querySelector("div");
-        if (inner) {
-          const idiv = inner.getBoundingClientRect();
-          const ics = getComputedStyle(inner);
-          console.log("[G] inner div rect:", idiv);
-          console.log(
-            "[G] inner div computed:",
-            "display =",
-            ics.display,
-            "| visibility =",
-            ics.visibility,
-            "| opacity =",
-            ics.opacity,
-            "| width =",
-            ics.width,
-            "| height =",
-            ics.height,
-          );
-        }
-
-        console.log(
-          "[G] container rect after render:",
-          container.getBoundingClientRect(),
-        );
-        console.groupEnd();
-      }, delay);
-    };
-    inspect(50);
-    inspect(300);
-    inspect(1000);
-
-    console.groupEnd();
   }, [googleScriptReady, googleUser, handleGoogleCredential]);
 
-  const handleSubmit = (e) => {
+  /* ============================================================
+     SUBMIT
+     ============================================================ */
+  const handleSubmit = async (e) => {
     e.preventDefault();
+    if (!googleUser) {
+      setError("Please sign in with Google first.");
+      return;
+    }
+    if (submitting) return;
+
     const nameRegex = /^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż ]+$/;
 
     if (!form.firstName.trim())
@@ -419,27 +292,47 @@ function App() {
     if (!form.lastName.trim()) return setError("Please enter your last name.");
     if (!nameRegex.test(form.lastName.trim()))
       return setError("Last name can only contain letters.");
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email))
-      return setError("Please enter a valid email address.");
 
     const age = Number(form.age);
     if (!Number.isInteger(age) || age < 18 || age > 120) {
       return setError("You must be at least 18 years old to join.");
     }
-    if (!interests.length) return setError("Add at least one interest.");
+    if (!interests.length) {
+      return setError("Add at least one interest.");
+    }
 
     setError("");
-    setSubmitted(true);
-    console.log("[submit] payload:", {
-      firstName: form.firstName,
-      lastName: form.lastName,
-      email: form.email,
-      age,
-      interests,
-      google: googleUser
-        ? { sub: googleUser.sub, email: googleUser.email }
-        : null,
-    });
+    setSubmitted(false);
+    setSubmitting(true);
+
+    try {
+      const payload = {
+        name: form.firstName.trim(),
+        surname: form.lastName.trim(),
+        age,
+        interests,
+      };
+
+      const res = await createUser(payload);
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Something went wrong.");
+      }
+
+      setSubmitted(true);
+
+      // odśwież dane użytkownika
+      const meRes = await authApi.me();
+      const me = await meRes.json();
+      if (me.authenticated) {
+        setAuth({ loading: false, user: me.user });
+      }
+    } catch (err) {
+      console.error("[submit] error:", err);
+      setError(err?.message || "Something went wrong. Please try again.");
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   const initials = (googleUser?.name || googleUser?.email || "?")
@@ -448,6 +341,11 @@ function App() {
     .slice(0, 2)
     .join("")
     .toUpperCase();
+
+  const profileCompleted = Boolean(
+    googleUser?.profile_completed ||
+    (googleUser?.name && googleUser?.surname && googleUser?.age != null),
+  );
 
   return (
     <main className="page">
@@ -495,14 +393,16 @@ function App() {
             </header>
 
             {error && <div className="error-message">{error}</div>}
-            {submitted && (
+            {submitted && profileCompleted && (
               <div className="success-message">
                 Welcome to findHER! Your profile has been created.
               </div>
             )}
 
             <div className="google-auth">
-              {googleUser ? (
+              {auth.loading ? (
+                <div className="google-loading">Checking session…</div>
+              ) : googleUser ? (
                 <div className="google-account">
                   {googleUser.picture ? (
                     <img
@@ -517,7 +417,7 @@ function App() {
                     </div>
                   )}
                   <div className="google-account-info">
-                    <strong>{googleUser.name}</strong>
+                    <strong>{googleUser.name || googleUser.email}</strong>
                     <span>{googleUser.email}</span>
                   </div>
                   <button
@@ -531,11 +431,16 @@ function App() {
                   </button>
                 </div>
               ) : GOOGLE_CONFIGURED ? (
-                <div
-                  className="google-slot"
-                  ref={googleSlotRef}
-                  style={{ minHeight: 44, minWidth: 240 }}
-                />
+                <>
+                  <p className="google-required-text">
+                    Sign in with Google to continue.
+                  </p>
+                  <div
+                    className="google-slot"
+                    ref={googleSlotRef}
+                    style={{ minHeight: 44, minWidth: 240 }}
+                  />
+                </>
               ) : (
                 <>
                   <button type="button" className="google-placeholder" disabled>
@@ -550,117 +455,135 @@ function App() {
               )}
             </div>
 
-            {!googleUser && (
+            {googleUser && !profileCompleted && (
               <div className="auth-divider">
                 <span>or</span>
               </div>
             )}
 
-            <form onSubmit={handleSubmit}>
-              <div className="fields-row">
-                <label>
-                  <span>First name</span>
-                  <input
-                    name="firstName"
-                    value={form.firstName}
-                    onChange={updateField}
-                    placeholder="Jane"
-                    autoComplete="given-name"
-                  />
-                </label>
-                <label>
-                  <span>Last name</span>
-                  <input
-                    name="lastName"
-                    value={form.lastName}
-                    onChange={updateField}
-                    placeholder="Doe"
-                    autoComplete="family-name"
-                  />
-                </label>
-              </div>
-
-              <div className="fields-row">
-                <label>
-                  <span>
-                    Email
-                    {googleUser && <em className="verified-badge">verified</em>}
-                  </span>
-                  <input
-                    type="email"
-                    name="email"
-                    value={form.email}
-                    onChange={updateField}
-                    placeholder="jane@example.com"
-                    autoComplete="email"
-                    readOnly={Boolean(googleUser)}
-                  />
-                </label>
-                <label>
-                  <span>Age</span>
-                  <input
-                    type="number"
-                    name="age"
-                    min="18"
-                    max="120"
-                    value={form.age}
-                    onChange={updateField}
-                    placeholder="24"
-                  />
-                </label>
-              </div>
-
-              <div className="interests">
-                <label>
-                  <span>Interests</span>
-                </label>
-                <div className="interest-input">
-                  <input
-                    type="text"
-                    name="interest"
-                    value={form.interest}
-                    onChange={updateField}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        addInterest();
-                      }
-                    }}
-                    placeholder="e.g. yoga, travel, art"
-                  />
-                  <button type="button" onClick={addInterest}>
-                    <Plus size={17} />
-                    Add
-                  </button>
+            {/* Formularz rejestracyjny – tylko gdy zalogowany i brak profilu */}
+            {googleUser && !profileCompleted && (
+              <form onSubmit={handleSubmit} noValidate>
+                <div className="fields-row">
+                  <label>
+                    <span>First name</span>
+                    <input
+                      name="firstName"
+                      value={form.firstName}
+                      onChange={updateField}
+                      placeholder="Jane"
+                      autoComplete="given-name"
+                    />
+                  </label>
+                  <label>
+                    <span>Last name</span>
+                    <input
+                      name="lastName"
+                      value={form.lastName}
+                      onChange={updateField}
+                      placeholder="Doe"
+                      autoComplete="family-name"
+                    />
+                  </label>
                 </div>
 
-                {interests.length > 0 && (
-                  <div className="interest-list">
-                    {interests.map((interest, index) => (
-                      <div className="interest-tag" key={interest}>
-                        <span>{interest}</span>
-                        <button
-                          type="button"
-                          onClick={() => removeInterest(index)}
-                          aria-label={`Remove ${interest}`}
-                        >
-                          <X size={13} />
-                        </button>
-                      </div>
-                    ))}
+                <div className="fields-row">
+                  <label>
+                    <span>
+                      Email
+                      <em className="verified-badge">verified</em>
+                    </span>
+                    <input
+                      type="email"
+                      name="email"
+                      value={form.email}
+                      readOnly
+                      autoComplete="email"
+                    />
+                  </label>
+                  <label>
+                    <span>Age</span>
+                    <input
+                      type="number"
+                      name="age"
+                      min="18"
+                      max="120"
+                      value={form.age}
+                      onChange={updateField}
+                      placeholder="24"
+                    />
+                  </label>
+                </div>
+
+                <div className="interests">
+                  <label>
+                    <span>Interests</span>
+                  </label>
+                  <div className="interest-input">
+                    <input
+                      type="text"
+                      name="interest"
+                      value={form.interest}
+                      onChange={updateField}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          addInterest();
+                        }
+                      }}
+                      placeholder="e.g. yoga, travel, art"
+                    />
+                    <button type="button" onClick={addInterest}>
+                      <Plus size={17} />
+                      Add
+                    </button>
                   </div>
-                )}
-              </div>
 
-              <button className="submit-button" type="submit">
-                Join findHER
-                <ArrowRight size={18} />
-              </button>
-            </form>
+                  {interests.length > 0 && (
+                    <div className="interest-list">
+                      {interests.map((interest, index) => (
+                        <div className="interest-tag" key={interest}>
+                          <span>{interest}</span>
+                          <button
+                            type="button"
+                            onClick={() => removeInterest(index)}
+                            aria-label={`Remove ${interest}`}
+                          >
+                            <X size={13} />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
 
-            <p className="login">
-              Already have an account? <a href="#login">Log in</a>
-            </p>
+                <button
+                  className="submit-button"
+                  type="submit"
+                  disabled={submitting}
+                >
+                  {submitting ? "Joining…" : "Join findHER"}
+                  <ArrowRight size={18} />
+                </button>
+              </form>
+            )}
+
+            {!googleUser && (
+              <p className="login">
+                Already have an account?{" "}
+                <a
+                  href="#login"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    googleSlotRef.current
+                      ?.querySelector("div[role=button]")
+                      ?.click();
+                  }}
+                >
+                  Log in
+                </a>
+              </p>
+            )}
           </div>
         </section>
       </div>
