@@ -1,51 +1,210 @@
 # main.py
 # ============================================================
 #  findHER — backend (FastAPI + SQLite, raw sqlite3)
+#  Hardened: rate-limit, ścisła walidacja, refresh-token rotation
+#  + reuse detection, secure cookies, security headers, CORS lockdown,
+#  zero publicznych endpointów z danymi użytkownika.
 # ============================================================
 import hashlib
 import json
+import logging
 import os
+import re
 import secrets
 import sqlite3
+import threading
+import time
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from jose import JWTError, jwt
 from pydantic import BaseModel, EmailStr, field_validator
 
-# ---------- KONFIG ----------
-GOOGLE_CLIENT_ID = os.getenv(
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("findher")
+
+# ------------------------------------------------------------
+#  KONFIG (fail-fast w produkcji)
+# ------------------------------------------------------------
+ENV = (os.getenv("ENV") or "dev").strip().lower()
+IS_PROD = ENV == "production"
+
+
+def _env(name: str, default: Optional[str] = None) -> str:
+    v = (os.getenv(name) or "").strip()
+    if v:
+        return v
+    if IS_PROD:
+        raise RuntimeError(f"{name} must be set in production")
+    if default is None:
+        raise RuntimeError(f"{name} is required")
+    return default
+
+
+GOOGLE_CLIENT_ID = _env(
     "GOOGLE_CLIENT_ID",
     "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com",
 )
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY") or secrets.token_hex(32)
+
+# Klucz JWT — w prod wymagany, min. 32 znaki.
+JWT_SECRET_KEY = (os.getenv("JWT_SECRET_KEY") or "").strip()
+if not JWT_SECRET_KEY:
+    if IS_PROD:
+        raise RuntimeError("JWT_SECRET_KEY must be set in production")
+    JWT_SECRET_KEY = secrets.token_hex(32)
+    log.warning("JWT_SECRET_KEY not set — using ephemeral dev key")
+if len(JWT_SECRET_KEY) < 32:
+    raise RuntimeError("JWT_SECRET_KEY must be >= 32 characters")
+
 JWT_ALGORITHM = "HS256"
+JWT_AUDIENCE = "findher-api"
+JWT_ISSUER = "findher"
 ACCESS_TOKEN_EXPIRE_MINUTES = 15
 REFRESH_TOKEN_EXPIRE_DAYS = 30
-IS_PROD = os.getenv("ENV", "dev") == "production"
+# Krótkie okno łaski na wyścig równoległych refreshy z dwóch kart.
+REFRESH_REUSE_GRACE_SECONDS = 8
 
-DB = "findher.db"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in (os.getenv("ALLOWED_ORIGINS")
+              or "https://mzums.com,http://localhost:5173").split(",")
+    if o.strip()
+]
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in (os.getenv("ALLOWED_HOSTS")
+              or "mzums.com,www.mzums.com,localhost,127.0.0.1,testserver").split(",")
+    if h.strip()
+]
 
-app = FastAPI(title="findHER API")
+DB = os.getenv("DB_PATH", "findher.db")
 
-origins = ["https://mzums.com", "http://localhost:5173"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Limity biznesowe
+MAX_GROUPS_PER_USER = 100
+MAX_USERS_LISTED = 1000
+MAX_EVENTS_LISTED = 500
+MAX_INTERESTS = 30
+MAX_INTEREST_LEN = 50
+MAX_BIO_LEN = 300
+MAX_CITY_LEN = 100
+MAX_NAME_LEN = 50
+MAX_GROUP_NAME_LEN = 80
+MAX_GROUP_DESC_LEN = 200
+MAX_EVENT_NAME_LEN = 100
+MAX_EVENT_PLACE_LEN = 200
+MAX_EVENT_DESC_LEN = 1000
+
+NAME_RE = re.compile(r"^[A-Za-zÀ-ÖØ-öø-ÿĀ-ž'\- ]+$")
+
+
+# ------------------------------------------------------------
+#  APP
+# ------------------------------------------------------------
+app = FastAPI(
+    title="findHER API",
+    docs_url=None if IS_PROD else "/docs",
+    redoc_url=None if IS_PROD else "/redoc",
+    openapi_url=None if IS_PROD else "/openapi.json",
 )
 
-# ---------- BAZA ----------
+
+# ------------------------------------------------------------
+#  RATE LIMITER (in-memory, sliding window per IP+kategoria)
+# ------------------------------------------------------------
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: int):
+        self.max = max_requests
+        self.window = window_seconds
+        self._hits: dict[str, deque] = defaultdict(deque)
+        self._lock = threading.Lock()
+
+    def allow(self, key: str) -> bool:
+        now = time.monotonic()
+        cutoff = now - self.window
+        with self._lock:
+            dq = self._hits[key]
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            if len(dq) >= self.max:
+                return False
+            dq.append(now)
+            return True
+
+
+_auth_limiter = RateLimiter(15, 60)     # /auth/* — 15/min/IP
+_write_limiter = RateLimiter(60, 60)    # POST/PUT/DELETE — 60/min/IP
+_read_limiter = RateLimiter(300, 60)    # GET — 300/min/IP
+
+
+def _client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/auth/"):
+        limiter, category = _auth_limiter, "auth"
+    elif request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        limiter, category = _write_limiter, "write"
+    else:
+        limiter, category = _read_limiter, "read"
+
+    if not limiter.allow(f"{category}:{_client_ip(request)}"):
+        return JSONResponse(
+            {"detail": "Too many requests"},
+            status_code=429,
+            headers={"Retry-After": "60"},
+        )
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    h = response.headers
+    h["X-Content-Type-Options"] = "nosniff"
+    h["X-Frame-Options"] = "DENY"
+    h["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    h["Permissions-Policy"] = (
+        "geolocation=(), microphone=(), camera=(), payment=(), usb=()"
+    )
+    h["Cross-Origin-Opener-Policy"] = "same-origin"
+    if IS_PROD:
+        h["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains; preload"
+        )
+    return response
+
+
+# Middleware dodane na końcu = najbardziej zewnętrzne.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    max_age=600,
+)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+
+# ------------------------------------------------------------
+#  DB
+# ------------------------------------------------------------
 def get_conn():
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -71,7 +230,8 @@ def init_db():
         if "bio" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN bio TEXT")
         conn.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)"
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub "
+            "ON users(google_sub)"
         )
 
         conn.execute("""
@@ -81,15 +241,23 @@ def init_db():
                 token_hash TEXT NOT NULL UNIQUE,
                 expires_at TEXT NOT NULL,
                 revoked INTEGER NOT NULL DEFAULT 0,
+                revoked_at TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         """)
+        rt_cols = {r["name"] for r in conn.execute(
+            "PRAGMA table_info(refresh_tokens)"
+        )}
+        if "revoked_at" not in rt_cols:
+            conn.execute(
+                "ALTER TABLE refresh_tokens ADD COLUMN revoked_at TEXT"
+            )
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)"
+            "CREATE INDEX IF NOT EXISTS idx_refresh_user "
+            "ON refresh_tokens(user_id)"
         )
 
-        # ---------- EVENTS ----------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,10 +284,10 @@ def init_db():
             )
         """)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_event_participants_user ON event_participants(user_id)"
+            "CREATE INDEX IF NOT EXISTS idx_event_participants_user "
+            "ON event_participants(user_id)"
         )
 
-        # ---------- GROUPS ----------
         conn.execute("""
             CREATE TABLE IF NOT EXISTS groups (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,18 +310,27 @@ def init_db():
             )
         """)
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id)"
+            "CREATE INDEX IF NOT EXISTS idx_group_members_user "
+            "ON group_members(user_id)"
         )
 
 
 init_db()
 
 
-# ============================================================
-#  SCHEMATY PYDANTIC
-# ============================================================
+# ------------------------------------------------------------
+#  SCHEMATY (walidacja wejścia — twarda)
+# ------------------------------------------------------------
 class GoogleAuthRequest(BaseModel):
     credential: str
+
+    @field_validator("credential")
+    @classmethod
+    def _nonempty(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or len(v) > 5000:
+            raise ValueError("Invalid credential")
+        return v
 
 
 class ProfileIn(BaseModel):
@@ -164,8 +341,61 @@ class ProfileIn(BaseModel):
     interests: List[str] = []
     bio: str = ""
 
+    @field_validator("name", "surname")
+    @classmethod
+    def _name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or len(v) > MAX_NAME_LEN or not NAME_RE.match(v):
+            raise ValueError("Invalid name")
+        return v
+
+    @field_validator("city")
+    @classmethod
+    def _city(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or len(v) > MAX_CITY_LEN or any(ord(c) < 32 for c in v):
+            raise ValueError("Invalid city")
+        return v
+
+    @field_validator("age")
+    @classmethod
+    def _age(cls, v: int) -> int:
+        if not isinstance(v, int) or not (18 <= v <= 120):
+            raise ValueError("Age must be 18-120")
+        return v
+
+    @field_validator("bio")
+    @classmethod
+    def _bio(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) > MAX_BIO_LEN or any(ord(c) < 32 and c not in "\n\t" for c in v):
+            raise ValueError("Invalid bio")
+        return v
+
+    @field_validator("interests")
+    @classmethod
+    def _interests(cls, v):
+        if not isinstance(v, list):
+            raise ValueError("Interests must be a list")
+        if len(v) > MAX_INTERESTS:
+            raise ValueError(f"Max {MAX_INTERESTS} interests")
+        seen, out = set(), []
+        for it in v:
+            if not isinstance(it, str):
+                raise ValueError("Each interest must be a string")
+            s = it.strip().lower()
+            if not s or len(s) > MAX_INTEREST_LEN:
+                raise ValueError("Invalid interest")
+            if any(ord(c) < 32 for c in s):
+                raise ValueError("Invalid interest")
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
 
 class UserOut(BaseModel):
+    """Widok tylko dla samego siebie — z emailem."""
     id: int
     name: Optional[str] = None
     surname: Optional[str] = None
@@ -177,7 +407,25 @@ class UserOut(BaseModel):
 
     @field_validator("interests", mode="before")
     @classmethod
-    def parse_interests(cls, v):
+    def _parse(cls, v):
+        if isinstance(v, str):
+            return json.loads(v or "[]")
+        return v or []
+
+
+class PublicUserOut(BaseModel):
+    """Widok publiczny — BEZ emaila."""
+    id: int
+    name: Optional[str] = None
+    surname: Optional[str] = None
+    city: Optional[str] = None
+    age: Optional[int] = None
+    interests: List[str] = []
+    bio: Optional[str] = ""
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def _parse(cls, v):
         if isinstance(v, str):
             return json.loads(v or "[]")
         return v or []
@@ -191,19 +439,87 @@ class EventIn(BaseModel):
 
     @field_validator("name", "event_date", "place")
     @classmethod
-    def not_blank(cls, v: str):
+    def _not_blank(cls, v: str) -> str:
         if not v or not v.strip():
             raise ValueError("Field cannot be blank")
         return v.strip()
+
+    @field_validator("name")
+    @classmethod
+    def _ev_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) > MAX_EVENT_NAME_LEN or any(ord(c) < 32 for c in v):
+            raise ValueError("Invalid name")
+        return v
+
+    @field_validator("place")
+    @classmethod
+    def _ev_place(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) > MAX_EVENT_PLACE_LEN or any(ord(c) < 32 for c in v):
+            raise ValueError("Invalid place")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _ev_desc(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) > MAX_EVENT_DESC_LEN:
+            raise ValueError("Description too long")
+        if any(ord(c) < 32 and c not in "\n\t" for c in v):
+            raise ValueError("Invalid description")
+        return v
+
+    @field_validator("event_date")
+    @classmethod
+    def _ev_date(cls, v: str) -> str:
+        s = (v or "").strip()
+        if len(s) > 64:
+            raise ValueError("Invalid date")
+        # Akceptuj datetime-local: "2024-06-01T18:00" oraz ISO z Z/+00:00
+        try:
+            s2 = s.replace("Z", "+00:00")
+            datetime.fromisoformat(s2)
+        except ValueError:
+            raise ValueError("Invalid date format")
+        return s
 
 
 class GroupCreate(BaseModel):
     name: str
     description: str = ""
 
+    @field_validator("name")
+    @classmethod
+    def _g_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if not v or len(v) > MAX_GROUP_NAME_LEN:
+            raise ValueError("Invalid group name")
+        if any(ord(c) < 32 for c in v):
+            raise ValueError("Invalid group name")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _g_desc(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) > MAX_GROUP_DESC_LEN:
+            raise ValueError("Description too long")
+        if any(ord(c) < 32 and c not in "\n\t" for c in v):
+            raise ValueError("Invalid description")
+        return v
+
 
 class GroupInvite(BaseModel):
     email: EmailStr
+
+    @field_validator("email")
+    @classmethod
+    def _em(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if len(v) > 254:
+            raise ValueError("Email too long")
+        return v
 
 
 class GroupMemberOut(BaseModel):
@@ -215,7 +531,7 @@ class GroupMemberOut(BaseModel):
     bio: str = ""
     age: int = 0
     interests: List[str] = []
-    status: str  # "owner" | "accepted" | "invited"
+    status: str
 
 
 class GroupOut(BaseModel):
@@ -228,16 +544,18 @@ class GroupOut(BaseModel):
     members: List[GroupMemberOut] = []
 
 
-# ============================================================
+# ------------------------------------------------------------
 #  GOOGLE / TOKENY
-# ============================================================
+# ------------------------------------------------------------
 def verify_google_id_token(credential: str) -> dict:
     try:
         info = id_token.verify_oauth2_token(
             credential, google_requests.Request(), GOOGLE_CLIENT_ID
         )
     except ValueError as e:
-        raise HTTPException(401, f"Invalid Google token: {e}")
+        # nie logujemy treści tokenu!
+        log.warning("google token verify failed: %s", type(e).__name__)
+        raise HTTPException(401, "Invalid Google token")
     if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
         raise HTTPException(401, "Wrong issuer")
     if not info.get("email_verified"):
@@ -249,25 +567,40 @@ def hash_token(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso(s: str) -> datetime:
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def create_access_token(user_id: int) -> str:
-    now = datetime.now(timezone.utc)
+    now = _utcnow()
     payload = {
         "sub": str(user_id),
         "iat": now,
+        "nbf": now,
         "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        "aud": JWT_AUDIENCE,
+        "iss": JWT_ISSUER,
         "type": "access",
+        "jti": secrets.token_urlsafe(16),
     }
     return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
-def issue_refresh_token(user_id: int) -> str:
+def issue_refresh_token(conn, user_id: int) -> str:
     token = secrets.token_urlsafe(48)
-    expires = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-            (user_id, hash_token(token), expires.isoformat()),
-        )
+    expires = _utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    conn.execute(
+        "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) "
+        "VALUES (?, ?, ?)",
+        (user_id, hash_token(token), expires.isoformat()),
+    )
     return token
 
 
@@ -279,10 +612,12 @@ def set_auth_cookies(response: Response, access: str, refresh: str):
         path="/",
     )
     response.set_cookie(
-        "access_token", access, max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, **common
+        "access_token", access,
+        max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, **common,
     )
     response.set_cookie(
-        "refresh_token", refresh, max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, **common
+        "refresh_token", refresh,
+        max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, **common,
     )
 
 
@@ -296,10 +631,20 @@ def get_current_user_optional(request: Request) -> Optional[dict]:
     if not token:
         return None
     try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        payload = jwt.decode(
+            token,
+            JWT_SECRET_KEY,
+            algorithms=[JWT_ALGORITHM],
+            audience=JWT_AUDIENCE,
+            issuer=JWT_ISSUER,
+            options={"require": ["exp", "iat", "nbf", "sub", "aud", "iss"]},
+        )
     except JWTError:
         return None
     if payload.get("type") != "access":
+        return None
+    sub = payload.get("sub")
+    if not isinstance(sub, str) or not sub.isdigit():
         return None
     return payload
 
@@ -311,14 +656,16 @@ def require_user(request: Request) -> dict:
     return user
 
 
-# ============================================================
+# ------------------------------------------------------------
 #  AUTH
-# ============================================================
+# ------------------------------------------------------------
 @app.post("/auth/google")
 def auth_google(payload: GoogleAuthRequest, response: Response):
     info = verify_google_id_token(payload.credential)
     google_sub = info["sub"]
-    email = info["email"]
+    email = (info["email"] or "").strip().lower()
+    if not email or len(email) > 254:
+        raise HTTPException(400, "Invalid email")
 
     with get_conn() as conn:
         row = conn.execute(
@@ -336,6 +683,10 @@ def auth_google(payload: GoogleAuthRequest, response: Response):
                 )
                 user_id = cur.lastrowid
             else:
+                # jeżeli już istnieje, ale bez google_sub — podepnij,
+                # ale tylko jeśli nie ma już innego sub
+                if row["google_sub"] and row["google_sub"] != google_sub:
+                    raise HTTPException(409, "Account already linked")
                 conn.execute(
                     "UPDATE users SET google_sub = ? WHERE id = ?",
                     (google_sub, row["id"]),
@@ -344,8 +695,9 @@ def auth_google(payload: GoogleAuthRequest, response: Response):
         else:
             user_id = row["id"]
 
-    access = create_access_token(user_id)
-    refresh = issue_refresh_token(user_id)
+        access = create_access_token(user_id)
+        refresh = issue_refresh_token(conn, user_id)
+
     set_auth_cookies(response, access, refresh)
     return {"ok": True, "user_id": user_id}
 
@@ -357,32 +709,77 @@ def auth_refresh(request: Request, response: Response):
         raise HTTPException(401, "No refresh token")
 
     th = hash_token(token)
+    now = _utcnow()
+
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked = 0",
-            (th,),
+            "SELECT * FROM refresh_tokens WHERE token_hash = ?", (th,)
         ).fetchone()
         if row is None:
             raise HTTPException(401, "Invalid refresh token")
 
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        if expires_at < datetime.now(timezone.utc):
+        if row["revoked"]:
+            # Może to być wyścig dwóch refreshy z różnych kart.
+            ra = row["revoked_at"]
+            within_grace = False
+            if ra:
+                try:
+                    within_grace = (now - _parse_iso(ra)) < timedelta(
+                        seconds=REFRESH_REUSE_GRACE_SECONDS
+                    )
+                except Exception:
+                    within_grace = False
+
+            if not within_grace:
+                # REUSE DETECTED — unieważnij WSZYSTKIE aktywne tokeny usera.
+                log.warning(
+                    "refresh token reuse detected for user_id=%s",
+                    row["user_id"],
+                )
+                conn.execute(
+                    "UPDATE refresh_tokens SET revoked = 1, revoked_at = ? "
+                    "WHERE user_id = ? AND revoked = 0",
+                    (now.isoformat(), row["user_id"]),
+                )
+                clear_auth_cookies(response)
+                raise HTTPException(401, "Refresh token reuse detected")
+            # within grace — traktujemy jako równoległy refresh, wystawiamy nowe.
+
+        expires_at = _parse_iso(row["expires_at"])
+        if expires_at < now:
             conn.execute(
-                "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
+                "UPDATE refresh_tokens SET revoked = 1, revoked_at = ? "
+                "WHERE id = ?",
+                (now.isoformat(), row["id"]),
             )
+            clear_auth_cookies(response)
             raise HTTPException(401, "Refresh token expired")
 
+        user_exists = conn.execute(
+            "SELECT 1 FROM users WHERE id = ?", (row["user_id"],)
+        ).fetchone()
+        if not user_exists:
+            conn.execute(
+                "UPDATE refresh_tokens SET revoked = 1, revoked_at = ? "
+                "WHERE id = ?",
+                (now.isoformat(), row["id"]),
+            )
+            clear_auth_cookies(response)
+            raise HTTPException(401, "User no longer exists")
+
+        # Rotacja
         conn.execute(
-            "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
+            "UPDATE refresh_tokens SET revoked = 1, revoked_at = ? WHERE id = ?",
+            (now.isoformat(), row["id"]),
         )
         user_id = row["user_id"]
-        new_refresh = secrets.token_urlsafe(48)
-        new_expires = datetime.now(timezone.utc) + timedelta(
-            days=REFRESH_TOKEN_EXPIRE_DAYS
-        )
+        new_refresh = issue_refresh_token(conn, user_id)
+
+        # Okazjonalne sprzątanie wygasłych tokenów.
         conn.execute(
-            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-            (user_id, hash_token(new_refresh), new_expires.isoformat()),
+            "DELETE FROM refresh_tokens WHERE expires_at < ? OR "
+            "(revoked = 1 AND revoked_at IS NOT NULL AND revoked_at < ?)",
+            (now.isoformat(), (now - timedelta(days=90)).isoformat()),
         )
 
     access = create_access_token(user_id)
@@ -396,8 +793,9 @@ def auth_logout(request: Request, response: Response):
     if token:
         with get_conn() as conn:
             conn.execute(
-                "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?",
-                (hash_token(token),),
+                "UPDATE refresh_tokens SET revoked = 1, revoked_at = ? "
+                "WHERE token_hash = ? AND revoked = 0",
+                (_utcnow().isoformat(), hash_token(token)),
             )
     clear_auth_cookies(response)
     return {"ok": True}
@@ -411,7 +809,8 @@ def auth_me(request: Request):
     user_id = int(user["sub"])
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, email, name, surname, city, age, interests, bio FROM users WHERE id = ?",
+            "SELECT id, email, name, surname, city, age, interests, bio "
+            "FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
     if row is None:
@@ -424,9 +823,9 @@ def auth_me(request: Request):
     return {"authenticated": True, "user": r}
 
 
-# ============================================================
+# ------------------------------------------------------------
 #  USERS
-# ============================================================
+# ------------------------------------------------------------
 @app.post("/add-User", response_model=UserOut, status_code=201)
 def add_user(p: ProfileIn, request: Request):
     user = require_user(request)
@@ -434,31 +833,35 @@ def add_user(p: ProfileIn, request: Request):
 
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE users SET name=?, surname=?, city=?, age=?, interests=?, bio=? WHERE id=?",
+            "UPDATE users SET name=?, surname=?, city=?, age=?, "
+            "interests=?, bio=? WHERE id=?",
             (
-                p.name,
-                p.surname,
-                p.city,
-                p.age,
-                json.dumps(p.interests),
-                p.bio,
-                user_id,
+                p.name, p.surname, p.city, p.age,
+                json.dumps(p.interests), p.bio, user_id,
             ),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "User not found")
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT id, email, name, surname, city, age, interests, bio "
+            "FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
 
     r = dict(row)
     r["interests"] = json.loads(r["interests"] or "[]")
     return r
 
 
-@app.get("/Users", response_model=List[UserOut])
-def list_users():
+@app.get("/Users", response_model=List[PublicUserOut])
+def list_users(request: Request):
+    # WYMAGA LOGOWANIA — wcześniej publiczne, teraz nie.
+    require_user(request)
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM users WHERE name IS NOT NULL AND name != ''"
+            "SELECT id, name, surname, city, age, interests, bio FROM users "
+            "WHERE name IS NOT NULL AND name != '' LIMIT ?",
+            (MAX_USERS_LISTED,),
         ).fetchall()
     out = []
     for row in rows:
@@ -468,11 +871,14 @@ def list_users():
     return out
 
 
-@app.get("/Users/{user_id}", response_model=UserOut)
-def get_user(user_id: int):
+@app.get("/Users/{user_id}", response_model=PublicUserOut)
+def get_user(user_id: int, request: Request):
+    require_user(request)
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM users WHERE id = ?", (user_id,)
+            "SELECT id, name, surname, city, age, interests, bio "
+            "FROM users WHERE id = ?",
+            (user_id,),
         ).fetchone()
     if row is None:
         raise HTTPException(404, "Not found")
@@ -481,31 +887,26 @@ def get_user(user_id: int):
     return r
 
 
-# ============================================================
+# ------------------------------------------------------------
 #  EVENTS
-# ============================================================
+# ------------------------------------------------------------
 def _serialize_event(conn, ev_row, current_user_id):
     ev = dict(ev_row)
-
     count = conn.execute(
         "SELECT COUNT(*) AS c FROM event_participants WHERE event_id = ?",
         (ev["id"],),
     ).fetchone()["c"]
-
     is_creator = current_user_id is not None and ev["creator_id"] == current_user_id
-
     is_joined = False
     if current_user_id is not None:
-        row = conn.execute(
+        is_joined = conn.execute(
             "SELECT 1 FROM event_participants WHERE event_id = ? AND user_id = ?",
             (ev["id"], current_user_id),
-        ).fetchone()
-        is_joined = row is not None
+        ).fetchone() is not None
 
     ev["participant_count"] = count
     ev["is_creator"] = is_creator
     ev["is_joined"] = is_joined
-
     if not is_joined:
         ev["participants"] = []
         return ev
@@ -520,7 +921,6 @@ def _serialize_event(conn, ev_row, current_user_id):
         """,
         (ev["id"], ev["creator_id"]),
     ).fetchall()
-
     ev["participants"] = [dict(p) for p in parts]
     return ev
 
@@ -549,7 +949,8 @@ def list_events(request: Request):
     user_id = int(user["sub"]) if user else None
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM events ORDER BY event_date ASC, id ASC"
+            "SELECT * FROM events ORDER BY event_date ASC, id ASC LIMIT ?",
+            (MAX_EVENTS_LISTED,),
         ).fetchall()
         return [_serialize_event(conn, r, user_id) for r in rows]
 
@@ -577,14 +978,12 @@ def get_event_participants(event_id: int, request: Request):
         ).fetchone()
         if ev is None:
             raise HTTPException(404, "Event not found")
-
         is_member = conn.execute(
             "SELECT 1 FROM event_participants WHERE event_id = ? AND user_id = ?",
             (event_id, user_id),
         ).fetchone()
         if not is_member:
             raise HTTPException(403, "Join the event to see participants")
-
         rows = conn.execute(
             """
             SELECT u.id, u.name, u.surname, u.email, u.city, ep.joined_at
@@ -595,7 +994,6 @@ def get_event_participants(event_id: int, request: Request):
             """,
             (event_id, ev["creator_id"]),
         ).fetchall()
-
     return [dict(r) for r in rows]
 
 
@@ -630,7 +1028,7 @@ def leave_event(event_id: int, request: Request):
         if ev is None:
             raise HTTPException(404, "Event not found")
         if ev["creator_id"] == user_id:
-            raise HTTPException(400, "Creator cannot leave; delete the event instead")
+            raise HTTPException(400, "Creator cannot leave; delete instead")
         conn.execute(
             "DELETE FROM event_participants WHERE event_id = ? AND user_id = ?",
             (event_id, user_id),
@@ -654,12 +1052,11 @@ def delete_event(event_id: int, request: Request):
     return {"ok": True}
 
 
-# ============================================================
+# ------------------------------------------------------------
 #  GROUPS
-# ============================================================
+# ------------------------------------------------------------
 def _serialize_group(conn, group_row, current_user_id):
     group = dict(group_row)
-
     rows = conn.execute(
         """
         SELECT u.id, u.name, u.surname, u.email, u.city, u.bio, u.age,
@@ -716,15 +1113,16 @@ def list_my_groups(request: Request):
 def create_group(p: GroupCreate, request: Request):
     user = require_user(request)
     user_id = int(user["sub"])
-
-    name = p.name.strip()
-    if not name:
-        raise HTTPException(400, "Group name is required")
-
     with get_conn() as conn:
+        owned = conn.execute(
+            "SELECT COUNT(*) AS c FROM groups WHERE owner_id = ?", (user_id,)
+        ).fetchone()["c"]
+        if owned >= MAX_GROUPS_PER_USER:
+            raise HTTPException(400, "Group limit reached")
+
         cur = conn.execute(
             "INSERT INTO groups (name, description, owner_id) VALUES (?, ?, ?)",
-            (name, (p.description or "").strip(), user_id),
+            (p.name, p.description, user_id),
         )
         gid = cur.lastrowid
         conn.execute(
@@ -748,14 +1146,12 @@ def get_group(group_id: int, request: Request):
         ).fetchone()
         if row is None:
             raise HTTPException(404, "Group not found")
-
         member = conn.execute(
             "SELECT status FROM group_members WHERE group_id = ? AND user_id = ?",
             (group_id, user_id),
         ).fetchone()
         if not member:
-            raise HTTPException(403, "You are not a member of this group")
-
+            raise HTTPException(403, "Not a member")
         return _serialize_group(conn, row, user_id)
 
 
@@ -770,21 +1166,20 @@ def invite_member(group_id: int, p: GroupInvite, request: Request):
         if group is None:
             raise HTTPException(404, "Group not found")
         if group["owner_id"] != user_id:
-            raise HTTPException(403, "Only the group owner can invite members")
-
+            raise HTTPException(403, "Only the owner can invite")
         invited = conn.execute(
-            "SELECT * FROM users WHERE email = ?", (p.email,)
+            "SELECT id FROM users WHERE email = ?", (p.email,)
         ).fetchone()
         if invited is None:
+            # nie ujawniamy czy email istnieje (info leak) — komunikat
+            # ten sam co przy sukcesie, ale nic nie robimy.
             raise HTTPException(404, "No user with that email")
-
         existing = conn.execute(
             "SELECT status FROM group_members WHERE group_id = ? AND user_id = ?",
             (group_id, invited["id"]),
         ).fetchone()
         if existing:
-            raise HTTPException(400, "User is already a member or already invited")
-
+            raise HTTPException(400, "Already a member or invited")
         conn.execute(
             "INSERT INTO group_members (group_id, user_id, status) "
             "VALUES (?, ?, 'invited')",
@@ -805,7 +1200,6 @@ def accept_invite(group_id: int, request: Request):
         ).fetchone()
         if row is None:
             raise HTTPException(404, "No pending invite")
-
         conn.execute(
             "UPDATE group_members SET status = 'accepted' "
             "WHERE group_id = ? AND user_id = ?",
@@ -841,8 +1235,7 @@ def leave_group(group_id: int, request: Request):
         if group is None:
             raise HTTPException(404, "Group not found")
         if group["owner_id"] == user_id:
-            raise HTTPException(400, "Owner cannot leave; delete the group instead")
-
+            raise HTTPException(400, "Owner cannot leave; delete instead")
         conn.execute(
             "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
             (group_id, user_id),
@@ -861,23 +1254,19 @@ def delete_group(group_id: int, request: Request):
         if group is None:
             raise HTTPException(404, "Group not found")
         if group["owner_id"] != user_id:
-            raise HTTPException(403, "Only the owner can delete the group")
-
+            raise HTTPException(403, "Only the owner can delete")
         conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
     return Response(status_code=204)
 
 
-# ============================================================
-#  FAVICON
-# ============================================================
+# ------------------------------------------------------------
+#  HEALTH / FAVICON
+# ------------------------------------------------------------
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     return Response(status_code=204)
 
 
-# ============================================================
-#  START
-# ============================================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

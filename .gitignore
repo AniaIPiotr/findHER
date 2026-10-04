@@ -50,3 +50,4 @@ packages/react-devtools-shell/dist
 packages/react-devtools-cdt-mcp/dist
 web/dist/
 db/findher.db
+.env

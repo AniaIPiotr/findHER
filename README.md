@@ -1,6 +1,3 @@
-# README.md
-
-```markdown
 # findHER 🌸
 
 A community platform that connects women nearby — for friendship, collaboration, or something more. Users sign in with Google, build a profile with interests, discover other women, and create/join local events.
@@ -33,6 +30,7 @@ A community platform that connects women nearby — for friendship, collaboratio
 
 ## 📁 Project Structure
 
+```
 .
 ├── backend/
 │ ├── main.py # FastAPI app: auth, users, events
@@ -50,6 +48,7 @@ A community platform that connects women nearby — for friendship, collaboratio
 │ └── index.css
 │
 └── README.md
+
 ```
 
 ---
@@ -243,13 +242,3 @@ Primary key: `(event_id, user_id)`.
 - [ ] Profile pictures upload
 - [ ] Location-based filtering (city / radius)
 - [ ] i18n (EN / PL)
-
----
-
-## 📝 License
-
-Private project — all rights reserved.
-
-```
-
-```
