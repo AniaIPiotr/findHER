@@ -11,7 +11,12 @@ import {
 } from "lucide-react";
 import "./Dashboard.css";
 
-export default function Dashboard({ user, onSignOut, onNavigate, interests = [] }) {
+export default function Dashboard({
+  user,
+  onSignOut,
+  onNavigate,
+  interests = [],
+}) {
   const displayName = user?.name || user?.email || "there";
   const firstName = displayName.split(" ")[0];
   const userInterests = Array.isArray(user?.interests)
@@ -86,6 +91,7 @@ export default function Dashboard({ user, onSignOut, onNavigate, interests = [] 
           </button>
         </article>
 
+        {/*
         <article className="dashboard-card">
           <div className="dashboard-card-icon">
             <Heart size={20} />
@@ -96,6 +102,7 @@ export default function Dashboard({ user, onSignOut, onNavigate, interests = [] 
             No matches yet
           </button>
         </article>
+        */}
 
         <article className="dashboard-card">
           <div className="dashboard-card-icon">
@@ -107,7 +114,6 @@ export default function Dashboard({ user, onSignOut, onNavigate, interests = [] 
             See groups
           </button>
         </article>
-
         <article className="dashboard-card">
           <div className="dashboard-card-icon">
             <Calendar size={20} />
@@ -135,11 +141,12 @@ export default function Dashboard({ user, onSignOut, onNavigate, interests = [] 
           </div>
         </section>
       )}
-
+      {/*
       <section className="dashboard-location">
         <MapPin size={16} />
         <span>Discovering women near you</span>
       </section>
+      */}
     </main>
   );
 }
