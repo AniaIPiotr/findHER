@@ -82,6 +82,36 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_refresh_user ON refresh_tokens(user_id)"
         )
 
+        # ---------- EVENTS ----------
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                event_date TEXT NOT NULL,
+                place TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (creator_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_events_date ON events(event_date)"
+        )
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS event_participants (
+                event_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                joined_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (event_id, user_id),
+                FOREIGN KEY (event_id) REFERENCES events(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_event_participants_user ON event_participants(user_id)"
+        )
+
 
 init_db()
 
@@ -115,6 +145,20 @@ class UserOut(BaseModel):
         if isinstance(v, str):
             return json.loads(v or "[]")
         return v or []
+
+
+class EventIn(BaseModel):
+    name: str
+    event_date: str  # ISO string, np. "2024-06-15T18:00"
+    place: str
+    description: str = ""
+
+    @field_validator("name", "event_date", "place")
+    @classmethod
+    def not_blank(cls, v: str):
+        if not v or not v.strip():
+            raise ValueError("Field cannot be blank")
+        return v.strip()
 
 
 # ---------- GOOGLE ----------
@@ -160,8 +204,6 @@ def issue_refresh_token(user_id: int) -> str:
 
 
 def set_auth_cookies(response: Response, access: str, refresh: str):
-    # SameSite: 'lax' na dev (localhost:5173 -> localhost:8000 to same-site),
-    # 'strict' lub 'none' (Secure) na prod w zależności od domen.
     common = dict(
         httponly=True,
         secure=IS_PROD,
@@ -215,7 +257,6 @@ def auth_google(payload: GoogleAuthRequest, response: Response):
         ).fetchone()
 
         if row is None:
-            # czy istnieje konto z tym e-mailem (np. po migracji ze starej wersji)?
             row = conn.execute(
                 "SELECT * FROM users WHERE email = ?", (email,)
             ).fetchone()
@@ -262,7 +303,6 @@ def auth_refresh(request: Request, response: Response):
             )
             raise HTTPException(401, "Refresh token expired")
 
-        # rotacja: unieważnij stary, wydaj nowy
         conn.execute(
             "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
         )
@@ -358,3 +398,117 @@ def get_user(user_id: int):
     r = dict(row)
     r["interests"] = json.loads(r["interests"] or "[]")
     return r
+
+
+# ---------- EVENTS ----------
+def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> dict:
+    ev = dict(ev_row)
+    parts = conn.execute(
+        """
+        SELECT u.id, u.name, u.surname, u.email, u.city, ep.joined_at
+        FROM event_participants ep
+        JOIN users u ON u.id = ep.user_id
+        WHERE ep.event_id = ?
+        ORDER BY (u.id = ?) DESC, ep.joined_at ASC
+        """,
+        (ev["id"], ev["creator_id"]),
+    ).fetchall()
+    participants = [dict(p) for p in parts]
+    ev["participants"] = participants
+    ev["participant_count"] = len(participants)
+    ev["is_creator"] = current_user_id is not None and ev["creator_id"] == current_user_id
+    ev["is_joined"] = (
+        current_user_id is not None
+        and any(p["id"] == current_user_id for p in participants)
+    )
+    return ev
+
+
+@app.post("/events", status_code=201)
+def create_event(p: EventIn, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO events (creator_id, name, event_date, place, description) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, p.name, p.event_date, p.place, p.description),
+        )
+        event_id = cur.lastrowid
+        # twórca automatycznie jest uczestnikiem
+        conn.execute(
+            "INSERT INTO event_participants (event_id, user_id) VALUES (?, ?)",
+            (event_id, user_id),
+        )
+    return {"ok": True, "id": event_id}
+
+
+@app.get("/events")
+def list_events(request: Request):
+    user = get_current_user_optional(request)
+    user_id = int(user["sub"]) if user else None
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM events ORDER BY event_date ASC, id ASC"
+        ).fetchall()
+        return [_serialize_event(conn, r, user_id) for r in rows]
+
+
+@app.get("/events/{event_id}")
+def get_event(event_id: int, request: Request):
+    user = get_current_user_optional(request)
+    user_id = int(user["sub"]) if user else None
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "Event not found")
+        return _serialize_event(conn, row, user_id)
+
+
+@app.post("/events/{event_id}/join")
+def join_event(event_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        ev = conn.execute("SELECT id FROM events WHERE id = ?", (event_id,)).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Event not found")
+        try:
+            conn.execute(
+                "INSERT INTO event_participants (event_id, user_id) VALUES (?, ?)",
+                (event_id, user_id),
+            )
+        except sqlite3.IntegrityError:
+            pass  # już dołączył
+    return {"ok": True}
+
+
+@app.delete("/events/{event_id}/leave")
+def leave_event(event_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Event not found")
+        if ev["creator_id"] == user_id:
+            raise HTTPException(400, "Creator cannot leave; delete the event instead")
+        conn.execute(
+            "DELETE FROM event_participants WHERE event_id = ? AND user_id = ?",
+            (event_id, user_id),
+        )
+    return {"ok": True}
+
+
+@app.delete("/events/{event_id}")
+def delete_event(event_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Event not found")
+        if ev["creator_id"] != user_id:
+            raise HTTPException(403, "Only the creator can delete this event")
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+    return {"ok": True}

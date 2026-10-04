@@ -120,7 +120,11 @@ export default function Dashboard({
           </div>
           <h3>Events</h3>
           <p>Local meetups, coffee chats, and workshops happening soon.</p>
-          <button className="dashboard-card-cta" type="button">
+          <button
+            className="dashboard-card-cta"
+            type="button"
+            onClick={() => onNavigate?.("events")}
+          >
             View events
           </button>
         </article>

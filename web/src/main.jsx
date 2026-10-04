@@ -5,6 +5,7 @@ import "./App.css";
 import { authApi, createUser } from "./api";
 import Dashboard from "./Dashboard";
 import Explore from "./Explore";
+import Events from "./Events";
 
 const GOOGLE_CLIENT_ID =
   "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com";
@@ -73,7 +74,7 @@ function App() {
     email: "",
     age: "",
     city: "",
-    bio: "", // ← nowe
+    bio: "",
     interest: "",
   });
   const [interests, setInterests] = useState([]);
@@ -139,7 +140,7 @@ function App() {
               lastName: data.user.surname || "",
               age: data.user.age != null ? String(data.user.age) : "",
               city: data.user.city || "",
-              bio: data.user.bio || "", // ← nowe
+              bio: data.user.bio || "",
             }));
           }
           if (Array.isArray(data.user.interests)) {
@@ -192,7 +193,7 @@ function App() {
         lastName: me.user.surname || prev.lastName,
         age: me.user.age != null ? String(me.user.age) : prev.age,
         city: me.user.city || prev.city,
-        bio: me.user.bio || prev.bio, // ← nowe
+        bio: me.user.bio || prev.bio,
       }));
       if (Array.isArray(me.user.interests) && me.user.interests.length) {
         setInterests(me.user.interests);
@@ -284,7 +285,7 @@ function App() {
      ============================================================ */
   useEffect(() => {
     if (!googleScriptReady) return;
-    if (googleUser) return; // już zalogowany – nie renderujemy przycisku
+    if (googleUser) return;
     const container = googleSlotRef.current;
     if (!container) return;
     if (!window.google?.accounts?.id) return;
@@ -349,7 +350,6 @@ function App() {
 
     if (!form.city.trim()) return setError("Please enter your city.");
 
-    // Bio – opcjonalne, ale jeśli jest, to z sensowną długością
     const bio = form.bio.trim();
     if (bio && bio.length < 10) {
       return setError("Bio should be at least 10 characters.");
@@ -372,7 +372,7 @@ function App() {
         surname: form.lastName.trim(),
         age,
         city: form.city.trim(),
-        bio, // ← nowe
+        bio,
         interests,
       };
 
@@ -387,7 +387,6 @@ function App() {
 
       setSubmitted(true);
 
-      // odśwież dane użytkownika
       const meRes = await authApi.me();
       const me = await meRes.json();
       if (me.authenticated) {
@@ -415,6 +414,10 @@ function App() {
 
   // === EKRAN PO ZALOGOWANIU ===
   if (googleUser && profileCompleted) {
+    if (view === "events") {
+      return <Events onBack={() => setView("dashboard")} />;
+    }
+
     if (view === "explore") {
       return (
         <Explore
@@ -638,7 +641,6 @@ function App() {
                     <span>Interests</span>
                   </label>
 
-                  {/* Predefiniowane – klikane chipy */}
                   <div className="interest-presets">
                     {PREDEFINED_INTERESTS.map((preset) => {
                       const active = interests.includes(preset);
@@ -657,7 +659,6 @@ function App() {
                     })}
                   </div>
 
-                  {/* Własne – input + przycisk Add */}
                   <div className="interest-input">
                     <input
                       type="text"
@@ -678,7 +679,6 @@ function App() {
                     </button>
                   </div>
 
-                  {/* Wybrane – wszystkie (predefiniowane + własne) */}
                   {interests.length > 0 && (
                     <div className="interest-list">
                       {interests.map((interest, index) => (
