@@ -325,11 +325,25 @@
   font-style: normal;
 }
 
-.event-locked-hint {
-  margin: 0;
-  font-size: 0.78rem;
+.event-participants-locked {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.85rem;
+  color: #9a9aa5;
+}
+
+.event-locked-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px dashed #3a3a46;
   color: #7b7b87;
-  font-style: italic;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 0.75rem;
+  margin-left: auto;
 }
 
 .event-actions {

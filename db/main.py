@@ -60,7 +60,6 @@ def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # migracja dla istniejącej tabeli bez google_sub
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
         if "google_sub" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
@@ -149,7 +148,7 @@ class UserOut(BaseModel):
 
 class EventIn(BaseModel):
     name: str
-    event_date: str  # ISO string, np. "2024-06-15T18:00"
+    event_date: str
     place: str
     description: str = ""
 
@@ -403,6 +402,34 @@ def get_user(user_id: int):
 # ---------- EVENTS ----------
 def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> dict:
     ev = dict(ev_row)
+
+    # 1) policz wszystkich (bez ujawniania danych)
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM event_participants WHERE event_id = ?",
+        (ev["id"],),
+    ).fetchone()["c"]
+
+    # 2) czy obecny user jest członkiem / hostem?
+    is_creator = current_user_id is not None and ev["creator_id"] == current_user_id
+
+    is_joined = False
+    if current_user_id is not None:
+        row = conn.execute(
+            "SELECT 1 FROM event_participants WHERE event_id = ? AND user_id = ?",
+            (ev["id"], current_user_id),
+        ).fetchone()
+        is_joined = row is not None
+
+    ev["participant_count"] = count
+    ev["is_creator"] = is_creator
+    ev["is_joined"] = is_joined
+
+    # 3) nie-członek: brak listy uczestników w odpowiedzi
+    if not is_joined:
+        ev["participants"] = []
+        return ev
+
+    # 4) członek / host: pełna lista
     parts = conn.execute(
         """
         SELECT u.id, u.name, u.surname, u.email, u.city, ep.joined_at
@@ -413,14 +440,8 @@ def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> 
         """,
         (ev["id"], ev["creator_id"]),
     ).fetchall()
-    participants = [dict(p) for p in parts]
-    ev["participants"] = participants
-    ev["participant_count"] = len(participants)
-    ev["is_creator"] = current_user_id is not None and ev["creator_id"] == current_user_id
-    ev["is_joined"] = (
-        current_user_id is not None
-        and any(p["id"] == current_user_id for p in participants)
-    )
+
+    ev["participants"] = [dict(p) for p in parts]
     return ev
 
 
@@ -435,7 +456,6 @@ def create_event(p: EventIn, request: Request):
             (user_id, p.name, p.event_date, p.place, p.description),
         )
         event_id = cur.lastrowid
-        # twórca automatycznie jest uczestnikiem
         conn.execute(
             "INSERT INTO event_participants (event_id, user_id) VALUES (?, ?)",
             (event_id, user_id),
@@ -465,6 +485,37 @@ def get_event(event_id: int, request: Request):
         return _serialize_event(conn, row, user_id)
 
 
+@app.get("/events/{event_id}/participants")
+def get_event_participants(event_id: int, request: Request):
+    """Twardy endpoint: lista uczestników tylko dla członków/hostów."""
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        ev = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Event not found")
+
+        is_member = conn.execute(
+            "SELECT 1 FROM event_participants WHERE event_id = ? AND user_id = ?",
+            (event_id, user_id),
+        ).fetchone()
+        if not is_member:
+            raise HTTPException(403, "Join the event to see participants")
+
+        rows = conn.execute(
+            """
+            SELECT u.id, u.name, u.surname, u.email, u.city, ep.joined_at
+            FROM event_participants ep
+            JOIN users u ON u.id = ep.user_id
+            WHERE ep.event_id = ?
+            ORDER BY (u.id = ?) DESC, ep.joined_at ASC
+            """,
+            (event_id, ev["creator_id"]),
+        ).fetchall()
+
+    return [dict(r) for r in rows]
+
+
 @app.post("/events/{event_id}/join")
 def join_event(event_id: int, request: Request):
     user = require_user(request)
@@ -479,7 +530,7 @@ def join_event(event_id: int, request: Request):
                 (event_id, user_id),
             )
         except sqlite3.IntegrityError:
-            pass  # już dołączył
+            pass
     return {"ok": True}
 
 

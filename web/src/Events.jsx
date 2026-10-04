@@ -10,6 +10,7 @@ import {
   Check,
   LogOut as LeaveIcon,
   Trash2,
+  Lock,
 } from "lucide-react";
 import "./Events.css";
 
@@ -222,124 +223,143 @@ export default function Events({ onBack }) {
         </div>
       ) : (
         <section className="events-list">
-          {events.map((ev) => (
-            <article
-              key={ev.id}
-              className={`event-card ${ev.is_joined ? "is-joined" : ""}`}
-            >
-              <div className="event-card-head">
-                <div>
-                  <h3>{ev.name}</h3>
-                  <div className="event-meta">
-                    <span>
-                      <CalendarIcon size={14} /> {formatDate(ev.event_date)}
-                    </span>
-                    <span>
-                      <MapPin size={14} /> {ev.place}
-                    </span>
-                  </div>
-                </div>
-                <div className="event-badges">
-                  {ev.is_creator && (
-                    <span className="event-badge event-badge--creator">
-                      Host
-                    </span>
-                  )}
-                  {ev.is_joined && !ev.is_creator && (
-                    <span className="event-badge event-badge--joined">
-                      Joined
-                    </span>
-                  )}
-                </div>
-              </div>
+          {events.map((ev) => {
+            const canSeeParticipants = ev.is_joined;
 
-              {ev.description && (
-                <p className="event-description">{ev.description}</p>
-              )}
-
-              <div className="event-participants">
-                <button
-                  type="button"
-                  className="event-participants-toggle"
-                  onClick={() => toggleExpanded(ev.id)}
-                >
-                  <Users size={14} />
-                  <span>
-                    {ev.participant_count}{" "}
-                    {ev.participant_count === 1 ? "attendee" : "attendees"}
-                  </span>
-                  <div className="event-avatars">
-                    {ev.participants.slice(0, 5).map((p) => (
-                      <span
-                        key={p.id}
-                        className="event-avatar"
-                        title={displayName(p)}
-                      >
-                        {initialsOf(p)}
+            return (
+              <article
+                key={ev.id}
+                className={`event-card ${ev.is_joined ? "is-joined" : ""}`}
+              >
+                <div className="event-card-head">
+                  <div>
+                    <h3>{ev.name}</h3>
+                    <div className="event-meta">
+                      <span>
+                        <CalendarIcon size={14} /> {formatDate(ev.event_date)}
                       </span>
-                    ))}
+                      <span>
+                        <MapPin size={14} /> {ev.place}
+                      </span>
+                    </div>
                   </div>
-                </button>
+                  <div className="event-badges">
+                    {ev.is_creator && (
+                      <span className="event-badge event-badge--creator">
+                        Host
+                      </span>
+                    )}
+                    {ev.is_joined && !ev.is_creator && (
+                      <span className="event-badge event-badge--joined">
+                        Joined
+                      </span>
+                    )}
+                  </div>
+                </div>
 
-                {expanded[ev.id] && (
-                  <ul className="event-participant-list">
-                    {ev.participants.map((p) => (
-                      <li key={p.id}>
-                        <span className="event-avatar event-avatar--small">
-                          {initialsOf(p)}
-                        </span>
-                        <span className="event-participant-name">
-                          {displayName(p)}
-                          {p.id === ev.creator_id && (
-                            <em className="event-participant-host"> · host</em>
-                          )}
-                        </span>
-                      </li>
-                    ))}
-                  </ul>
+                {ev.description && (
+                  <p className="event-description">{ev.description}</p>
                 )}
 
-                {!ev.is_joined && (
-                  <p className="event-locked-hint">
-                    Join the event to see who's coming.
-                  </p>
-                )}
-              </div>
+                <div className="event-participants">
+                  {canSeeParticipants ? (
+                    <>
+                      <button
+                        type="button"
+                        className="event-participants-toggle"
+                        onClick={() => toggleExpanded(ev.id)}
+                        aria-expanded={Boolean(expanded[ev.id])}
+                      >
+                        <Users size={14} />
+                        <span>
+                          {ev.participant_count}{" "}
+                          {ev.participant_count === 1
+                            ? "attendee"
+                            : "attendees"}
+                        </span>
+                        <div className="event-avatars">
+                          {ev.participants.slice(0, 5).map((p) => (
+                            <span
+                              key={p.id}
+                              className="event-avatar"
+                              title={displayName(p)}
+                            >
+                              {initialsOf(p)}
+                            </span>
+                          ))}
+                        </div>
+                      </button>
 
-              <div className="event-actions">
-                {ev.is_joined ? (
-                  ev.is_creator ? (
-                    <button
-                      type="button"
-                      className="event-btn event-btn--danger"
-                      onClick={() => deleteEvent(ev.id)}
-                    >
-                      <Trash2 size={14} />
-                      <span>Delete</span>
-                    </button>
+                      {expanded[ev.id] && (
+                        <ul className="event-participant-list">
+                          {ev.participants.map((p) => (
+                            <li key={p.id}>
+                              <span className="event-avatar event-avatar--small">
+                                {initialsOf(p)}
+                              </span>
+                              <span className="event-participant-name">
+                                {displayName(p)}
+                                {p.id === ev.creator_id && (
+                                  <em className="event-participant-host">
+                                    {" "}
+                                    · host
+                                  </em>
+                                )}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                    </>
+                  ) : (
+                    <div className="event-participants-locked">
+                      <Users size={14} />
+                      <span>
+                        {ev.participant_count}{" "}
+                        {ev.participant_count === 1 ? "attendee" : "attendees"}
+                      </span>
+                      <span className="event-locked-pill">
+                        <Lock size={12} /> Join to see who's coming
+                      </span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="event-actions">
+                  {ev.is_joined ? (
+                    ev.is_creator ? (
+                      <button
+                        type="button"
+                        className="event-btn event-btn--danger"
+                        onClick={() => deleteEvent(ev.id)}
+                      >
+                        <Trash2 size={14} />
+                        <span>Delete</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="event-btn event-btn--ghost"
+                        onClick={() => leaveEvent(ev.id)}
+                      >
+                        <LeaveIcon size={14} />
+                        <span>Leave</span>
+                      </button>
+                    )
                   ) : (
                     <button
                       type="button"
-                      className="event-btn event-btn--ghost"
-                      onClick={() => leaveEvent(ev.id)}
+                      className="event-btn event-btn--primary"
+                      onClick={() => joinEvent(ev.id)}
                     >
-                      <LeaveIcon size={14} />
-                      <span>Leave</span>
+                      <Check size={14} />
+                      <span>Join</span>
                     </button>
-                  )
-                ) : (
-                  <button
-                    type="button"
-                    className="event-btn event-btn--primary"
-                    onClick={() => joinEvent(ev.id)}
-                  >
-                    <Check size={14} />
-                    <span>Join</span>
-                  </button>
-                )}
-              </div>
-            </article>
-          ))}
+                  )}
+                </div>
+              </article>
+            );
+          })}
         </section>
       )}
     </main>
