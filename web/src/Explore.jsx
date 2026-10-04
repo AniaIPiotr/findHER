@@ -67,7 +67,6 @@ export default function Explore({ user, onBack, onSignOut }) {
   const [draftFilters, setDraftFilters] = useState(DEFAULT_FILTERS);
   const [filtersOpen, setFiltersOpen] = useState(false);
   const [index, setIndex] = useState(0);
-  const [liked, setLiked] = useState([]);
 
   const [extraCities, setExtraCities] = useState([]);
   const [extraInterests, setExtraInterests] = useState([]);
@@ -192,18 +191,9 @@ export default function Explore({ user, onBack, onSignOut }) {
   /* ============================================================
      Akcje
      ============================================================ */
-  const handleAction = (action) => {
-    if (!current) return;
-    if (action === "like" || action === "superlike") {
-      setLiked((prev) => [...prev, current.id]);
-      // TODO: POST /likes { target_id: current.id, type: action }
-    }
-    setIndex((i) => i + 1);
-  };
 
   const handleReset = () => {
     setIndex(0);
-    setLiked([]);
   };
 
   const openFilters = () => {
@@ -414,24 +404,6 @@ export default function Explore({ user, onBack, onSignOut }) {
           >
             <X size={26} />
           </button>
-
-          <button
-            type="button"
-            className="explore-btn explore-btn--super"
-            onClick={() => handleAction("superlike")}
-            aria-label="Super like"
-          >
-            <Star size={22} />
-          </button>
-
-          <button
-            type="button"
-            className="explore-btn explore-btn--like"
-            onClick={() => handleAction("like")}
-            aria-label="Like"
-          >
-            <Heart size={26} />
-          </button>
         </section>
       )}
 
@@ -439,7 +411,6 @@ export default function Explore({ user, onBack, onSignOut }) {
         <span>
           {isDone || loading ? 0 : index + 1} / {filteredProfiles.length}
         </span>
-        <span>{liked.length} liked</span>
       </footer>
 
       {/* ---------- Panel filtrów ---------- */}

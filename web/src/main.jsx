@@ -455,7 +455,7 @@ function App() {
             </h1>
             <p className="intro-text">
               findHER connects you with inspiring women near you — for
-              friendship, collaboration, or something more. Share a few things
+              friendship and collaboration. Share a few things
               about yourself and start discovering your people.
             </p>
           </div>
