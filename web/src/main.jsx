@@ -6,6 +6,7 @@ import { authApi, createUser } from "./api";
 import Dashboard from "./Dashboard";
 import Explore from "./Explore";
 import Events from "./Events";
+import Groups from "./Groups";
 
 const GOOGLE_CLIENT_ID =
   "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com";
@@ -427,6 +428,15 @@ function App() {
         />
       );
     }
+  if (view === "groups") {
+    return (
+      <Groups
+        user={googleUser}
+        onBack={() => setView("dashboard")}
+        onSignOut={handleGoogleSignOut}
+      />
+    );
+  }
 
     return (
       <Dashboard

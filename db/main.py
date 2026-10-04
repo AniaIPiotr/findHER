@@ -1,18 +1,34 @@
-import hashlib
-import json
+# main.py
+# ============================================================
+#  findHER — backend (FastAPI + SQLite + SQLAlchemy)
+# ============================================================
 import os
-import secrets
-import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from typing import List, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
-from google.oauth2 import id_token
-from jose import JWTError, jwt
-from pydantic import BaseModel, field_validator
+from google.oauth2 import id_token as google_id_token
+from pydantic import BaseModel, EmailStr
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Table,
+    Text,
+    create_engine,
+    func,
+    select,
+)
+from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
-# ---------- KONFIG ----------
+# ============================================================
+#  KONFIGURACJA
+# ============================================================
 GOOGLE_CLIENT_ID = os.getenv(
     "GOOGLE_CLIENT_ID",
     "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com",
@@ -60,6 +76,7 @@ def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # migracja dla istniejącej tabeli bez google_sub
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
         if "google_sub" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
@@ -122,236 +139,243 @@ class GoogleAuthRequest(BaseModel):
 class ProfileIn(BaseModel):
     name: str
     surname: str
-    city: str
     age: int
-    interests: list[str]
-    bio: str
+    city: str = ""
+    bio: str = ""
+    interests: List[str] = []
 
 
 class UserOut(BaseModel):
     id: int
-    name: str | None = None
-    surname: str | None = None
-    city: str | None = None
     email: str
-    age: int | None = None
-    interests: list[str] = []
-    bio: str
-
-    @field_validator("interests", mode="before")
-    @classmethod
-    def parse_interests(cls, v):
-        if isinstance(v, str):
-            return json.loads(v or "[]")
-        return v or []
-
-
-class EventIn(BaseModel):
     name: str
-    event_date: str
+    surname: str
+    age: Optional[int] = None
+    city: str = ""
+    bio: str = ""
+    interests: List[str] = []
+    profile_completed: bool = False
+
+
+class GoogleAuthIn(BaseModel):
+    credential: str
+
+
+class GroupCreate(BaseModel):
+    name: str
+    event_date: str  # ISO string, np. "2024-06-15T18:00"
     place: str
     description: str = ""
 
-    @field_validator("name", "event_date", "place")
-    @classmethod
-    def not_blank(cls, v: str):
-        if not v or not v.strip():
-            raise ValueError("Field cannot be blank")
-        return v.strip()
+
+class GroupInvite(BaseModel):
+    email: EmailStr
 
 
-# ---------- GOOGLE ----------
-def verify_google_id_token(credential: str) -> dict:
-    try:
-        info = id_token.verify_oauth2_token(
-            credential, google_requests.Request(), GOOGLE_CLIENT_ID
-        )
-    except ValueError as e:
-        raise HTTPException(401, f"Invalid Google token: {e}")
-    if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
-        raise HTTPException(401, "Wrong issuer")
-    if not info.get("email_verified"):
-        raise HTTPException(401, "Google email not verified")
-    return info
+class GroupMemberOut(BaseModel):
+    id: int
+    name: str
+    surname: str
+    email: str
+    city: str = ""
+    bio: str = ""
+    age: int = 0
+    interests: List[str] = []
+    status: str  # "owner" | "accepted" | "invited"
 
 
-# ---------- TOKENY ----------
-def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+class GroupOut(BaseModel):
+    id: int
+    name: str
+    description: str
+    owner_id: int
+    created_at: datetime
+    member_count: int
+    members: List[GroupMemberOut] = []
 
 
-def create_access_token(user_id: int) -> str:
-    now = datetime.now(timezone.utc)
-    payload = {
-        "sub": str(user_id),
-        "iat": now,
-        "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
-        "type": "access",
-    }
-    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+# ============================================================
+#  APP + CORS
+# ============================================================
+app = FastAPI(title="findHER API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def issue_refresh_token(user_id: int) -> str:
-    token = secrets.token_urlsafe(48)
-    expires = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-            (user_id, hash_token(token), expires.isoformat()),
-        )
+# ============================================================
+#  HELPERS: sesja / serializacja
+# ============================================================
+import json
+import secrets
+
+
+def user_to_out(u: User) -> UserOut:
+    return UserOut(
+        id=u.id,
+        email=u.email,
+        name=u.name or "",
+        surname=u.surname or "",
+        age=u.age,
+        city=u.city or "",
+        bio=u.bio or "",
+        interests=u.interests_list(),
+        profile_completed=bool(u.profile_completed),
+    )
+
+
+def create_session(db: Session, user_id: int) -> str:
+    token = secrets.token_urlsafe(32)
+    expires = datetime.utcnow() + timedelta(days=SESSION_TTL_DAYS)
+    db.add(SessionToken(token=token, user_id=user_id, expires_at=expires))
+    db.commit()
     return token
 
 
-def set_auth_cookies(response: Response, access: str, refresh: str):
-    common = dict(
+def set_session_cookie(response: Response, token: str):
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=token,
         httponly=True,
-        secure=IS_PROD,
-        samesite="strict" if IS_PROD else "lax",
+        samesite="lax",
+        secure=False,   # True na HTTPS w produkcji
+        max_age=SESSION_TTL_DAYS * 24 * 3600,
         path="/",
     )
-    response.set_cookie(
-        "access_token", access, max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, **common
-    )
-    response.set_cookie(
-        "refresh_token", refresh, max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, **common
-    )
 
 
-def clear_auth_cookies(response: Response):
-    response.delete_cookie("access_token", path="/")
-    response.delete_cookie("refresh_token", path="/")
+def clear_session_cookie(response: Response):
+    response.delete_cookie(SESSION_COOKIE, path="/")
 
 
-# ---------- DEPENDENCIES ----------
-def get_current_user_optional(request: Request) -> dict | None:
-    token = request.cookies.get("access_token")
+def current_user(request: Request, db: Session = Depends(get_db)) -> User:
+    token = request.cookies.get(SESSION_COOKIE)
     if not token:
-        return None
-    try:
-        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-    except JWTError:
-        return None
-    if payload.get("type") != "access":
-        return None
-    return payload
+        raise HTTPException(status_code=401, detail="Not authenticated")
 
+    row = db.get(SessionToken, token)
+    if not row or row.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=401, detail="Session expired")
 
-def require_user(request: Request) -> dict:
-    user = get_current_user_optional(request)
+    user = db.get(User, row.user_id)
     if not user:
-        raise HTTPException(401, "Not authenticated")
+        raise HTTPException(status_code=401, detail="User not found")
     return user
 
 
-# ---------- AUTH ----------
+# ============================================================
+#  AUTH: Google
+# ============================================================
 @app.post("/auth/google")
-def auth_google(payload: GoogleAuthRequest, response: Response):
-    info = verify_google_id_token(payload.credential)
-    google_sub = info["sub"]
-    email = info["email"]
-
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM users WHERE google_sub = ?", (google_sub,)
-        ).fetchone()
-
-        if row is None:
-            row = conn.execute(
-                "SELECT * FROM users WHERE email = ?", (email,)
-            ).fetchone()
-            if row is None:
-                cur = conn.execute(
-                    "INSERT INTO users (google_sub, email) VALUES (?, ?)",
-                    (google_sub, email),
-                )
-                user_id = cur.lastrowid
-            else:
-                conn.execute(
-                    "UPDATE users SET google_sub = ? WHERE id = ?",
-                    (google_sub, row["id"]),
-                )
-                user_id = row["id"]
-        else:
-            user_id = row["id"]
-
-    access = create_access_token(user_id)
-    refresh = issue_refresh_token(user_id)
-    set_auth_cookies(response, access, refresh)
-    return {"ok": True, "user_id": user_id}
-
-
-@app.post("/auth/refresh")
-def auth_refresh(request: Request, response: Response):
-    token = request.cookies.get("refresh_token")
-    if not token:
-        raise HTTPException(401, "No refresh token")
-
-    th = hash_token(token)
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked = 0",
-            (th,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(401, "Invalid refresh token")
-
-        expires_at = datetime.fromisoformat(row["expires_at"])
-        if expires_at < datetime.now(timezone.utc):
-            conn.execute(
-                "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
-            )
-            raise HTTPException(401, "Refresh token expired")
-
-        conn.execute(
-            "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
+def auth_google(
+    payload: GoogleAuthIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    try:
+        info = google_id_token.verify_oauth2_token(
+            payload.credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
         )
-        user_id = row["user_id"]
-        new_refresh = secrets.token_urlsafe(48)
-        new_expires = datetime.now(timezone.utc) + timedelta(
-            days=REFRESH_TOKEN_EXPIRE_DAYS
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
+
+    email = info.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Google account has no email")
+
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if not user:
+        user = User(
+            email=email,
+            name=info.get("given_name", "") or "",
+            surname=info.get("family_name", "") or "",
+            profile_completed=False,
         )
-        conn.execute(
-            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
-            (user_id, hash_token(new_refresh), new_expires.isoformat()),
-        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    else:
+        # aktualizuj avatar / imię z Google, jeśli się zmieniło
+        changed = False
+        if changed:
+            db.commit()
+            db.refresh(user)
 
-    access = create_access_token(user_id)
-    set_auth_cookies(response, access, new_refresh)
-    return {"ok": True}
-
-
-@app.post("/auth/logout")
-def auth_logout(request: Request, response: Response):
-    token = request.cookies.get("refresh_token")
-    if token:
-        with get_conn() as conn:
-            conn.execute(
-                "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?",
-                (hash_token(token),),
-            )
-    clear_auth_cookies(response)
-    return {"ok": True}
+    token = create_session(db, user.id)
+    set_session_cookie(response, token)
+    return {"ok": True, "user": user_to_out(user).model_dump()}
 
 
 @app.get("/auth/me")
-def auth_me(request: Request):
-    user = get_current_user_optional(request)
+def auth_me(request: Request, db: Session = Depends(get_db)):
+    token = request.cookies.get(SESSION_COOKIE)
+    if not token:
+        return {"authenticated": False, "user": None}
+
+    row = db.get(SessionToken, token)
+    if not row or row.expires_at < datetime.utcnow():
+        return {"authenticated": False, "user": None}
+
+    user = db.get(User, row.user_id)
     if not user:
-        return {"authenticated": False}
-    user_id = int(user["sub"])
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT id, email, name, surname, city, age, interests, bio FROM users WHERE id = ?",
-            (user_id,),
-        ).fetchone()
-    if row is None:
-        return {"authenticated": False}
-    r = dict(row)
-    r["interests"] = json.loads(r["interests"] or "[]")
-    r["profile_completed"] = bool(
-        r["name"] and r["surname"] and r["age"] is not None
-    )
-    return {"authenticated": True, "user": r}
+        return {"authenticated": False, "user": None}
+
+    return {"authenticated": True, "user": user_to_out(user).model_dump()}
+
+
+@app.post("/auth/logout")
+def auth_logout(response: Response, request: Request, db: Session = Depends(get_db)):
+    token = request.cookies.get(SESSION_COOKIE)
+    if token:
+        row = db.get(SessionToken, token)
+        if row:
+            db.delete(row)
+            db.commit()
+    clear_session_cookie(response)
+    return {"ok": True}
+
+
+# ============================================================
+#  USERS
+# ============================================================
+@app.post("/add-User")
+def add_user(
+    payload: UserCreate,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    name = payload.name.strip()
+    surname = payload.surname.strip()
+    city = (payload.city or "").strip()
+    bio = (payload.bio or "").strip()
+
+    if not name:
+        raise HTTPException(400, "Name is required")
+    if not surname:
+        raise HTTPException(400, "Surname is required")
+    if payload.age is None or payload.age < 18 or payload.age > 120:
+        raise HTTPException(400, "Age must be between 18 and 120")
+    if not city:
+        raise HTTPException(400, "City is required")
+
+    me.name = name
+    me.surname = surname
+    me.age = payload.age
+    me.city = city
+    me.bio = bio
+    me.interests = json.dumps(payload.interests or [])
+    me.profile_completed = True
+
+    db.commit()
+    db.refresh(me)
+    return user_to_out(me)
 
 
 # ---------- USERS ----------
@@ -402,34 +426,6 @@ def get_user(user_id: int):
 # ---------- EVENTS ----------
 def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> dict:
     ev = dict(ev_row)
-
-    # 1) policz wszystkich (bez ujawniania danych)
-    count = conn.execute(
-        "SELECT COUNT(*) AS c FROM event_participants WHERE event_id = ?",
-        (ev["id"],),
-    ).fetchone()["c"]
-
-    # 2) czy obecny user jest członkiem / hostem?
-    is_creator = current_user_id is not None and ev["creator_id"] == current_user_id
-
-    is_joined = False
-    if current_user_id is not None:
-        row = conn.execute(
-            "SELECT 1 FROM event_participants WHERE event_id = ? AND user_id = ?",
-            (ev["id"], current_user_id),
-        ).fetchone()
-        is_joined = row is not None
-
-    ev["participant_count"] = count
-    ev["is_creator"] = is_creator
-    ev["is_joined"] = is_joined
-
-    # 3) nie-członek: brak listy uczestników w odpowiedzi
-    if not is_joined:
-        ev["participants"] = []
-        return ev
-
-    # 4) członek / host: pełna lista
     parts = conn.execute(
         """
         SELECT u.id, u.name, u.surname, u.email, u.city, ep.joined_at
@@ -440,8 +436,14 @@ def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> 
         """,
         (ev["id"], ev["creator_id"]),
     ).fetchall()
-
-    ev["participants"] = [dict(p) for p in parts]
+    participants = [dict(p) for p in parts]
+    ev["participants"] = participants
+    ev["participant_count"] = len(participants)
+    ev["is_creator"] = current_user_id is not None and ev["creator_id"] == current_user_id
+    ev["is_joined"] = (
+        current_user_id is not None
+        and any(p["id"] == current_user_id for p in participants)
+    )
     return ev
 
 
@@ -456,6 +458,7 @@ def create_event(p: EventIn, request: Request):
             (user_id, p.name, p.event_date, p.place, p.description),
         )
         event_id = cur.lastrowid
+        # twórca automatycznie jest uczestnikiem
         conn.execute(
             "INSERT INTO event_participants (event_id, user_id) VALUES (?, ?)",
             (event_id, user_id),
@@ -463,26 +466,64 @@ def create_event(p: EventIn, request: Request):
     return {"ok": True, "id": event_id}
 
 
-@app.get("/events")
-def list_events(request: Request):
-    user = get_current_user_optional(request)
-    user_id = int(user["sub"]) if user else None
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM events ORDER BY event_date ASC, id ASC"
-        ).fetchall()
-        return [_serialize_event(conn, r, user_id) for r in rows]
+@app.get("/groups/{group_id}", response_model=GroupOut)
+def get_group(
+    group_id: int,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    group = db.get(Group, group_id)
+    if not group:
+        raise HTTPException(404, "Group not found")
+
+    row = db.execute(
+        select(group_members.c.status)
+        .where(group_members.c.group_id == group_id)
+        .where(group_members.c.user_id == me.id)
+    ).first()
+
+    if not row:
+        raise HTTPException(403, "You are not a member of this group")
+
+    return _serialize_group(group, db)
 
 
-@app.get("/events/{event_id}")
-def get_event(event_id: int, request: Request):
-    user = get_current_user_optional(request)
-    user_id = int(user["sub"]) if user else None
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-        if row is None:
-            raise HTTPException(404, "Event not found")
-        return _serialize_event(conn, row, user_id)
+@app.post("/groups/{group_id}/invite", response_model=GroupOut)
+def invite_member(
+    group_id: int,
+    payload: GroupInvite,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    group = db.get(Group, group_id)
+    if not group:
+        raise HTTPException(404, "Group not found")
+    if group.owner_id != me.id:
+        raise HTTPException(403, "Only the group owner can invite members")
+
+    invited = db.execute(
+        select(User).where(User.email == payload.email)
+    ).scalar_one_or_none()
+    if not invited:
+        raise HTTPException(404, "No user with that email")
+
+    existing = db.execute(
+        select(group_members.c.status)
+        .where(group_members.c.group_id == group_id)
+        .where(group_members.c.user_id == invited.id)
+    ).first()
+
+    if existing:
+        raise HTTPException(400, "User is already a member or already invited")
+
+    db.execute(
+        group_members.insert().values(
+            group_id=group_id, user_id=invited.id, status="invited"
+        )
+    )
+    db.commit()
+    db.refresh(group)
+    return _serialize_group(group, db)
 
 
 @app.get("/events/{event_id}/participants")
@@ -530,36 +571,80 @@ def join_event(event_id: int, request: Request):
                 (event_id, user_id),
             )
         except sqlite3.IntegrityError:
-            pass
+            pass  # już dołączył
     return {"ok": True}
 
 
-@app.delete("/events/{event_id}/leave")
-def leave_event(event_id: int, request: Request):
-    user = require_user(request)
-    user_id = int(user["sub"])
-    with get_conn() as conn:
-        ev = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-        if ev is None:
-            raise HTTPException(404, "Event not found")
-        if ev["creator_id"] == user_id:
-            raise HTTPException(400, "Creator cannot leave; delete the event instead")
-        conn.execute(
-            "DELETE FROM event_participants WHERE event_id = ? AND user_id = ?",
-            (event_id, user_id),
+@app.post("/groups/{group_id}/decline", status_code=204)
+def decline_invite(
+    group_id: int,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    db.execute(
+        group_members.delete()
+        .where(group_members.c.group_id == group_id)
+        .where(group_members.c.user_id == me.id)
+        .where(group_members.c.status == "invited")
+    )
+    db.commit()
+    return Response(status_code=204)
+
+
+@app.delete("/groups/{group_id}/leave", status_code=204)
+def leave_group(
+    group_id: int,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    group = db.get(Group, group_id)
+    if not group:
+        raise HTTPException(404, "Group not found")
+    if group.owner_id == me.id:
+        raise HTTPException(
+            400, "Owner cannot leave — delete the group instead"
         )
-    return {"ok": True}
+
+    db.execute(
+        group_members.delete()
+        .where(group_members.c.group_id == group_id)
+        .where(group_members.c.user_id == me.id)
+    )
+    db.commit()
+    return Response(status_code=204)
 
 
-@app.delete("/events/{event_id}")
-def delete_event(event_id: int, request: Request):
-    user = require_user(request)
-    user_id = int(user["sub"])
-    with get_conn() as conn:
-        ev = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
-        if ev is None:
-            raise HTTPException(404, "Event not found")
-        if ev["creator_id"] != user_id:
-            raise HTTPException(403, "Only the creator can delete this event")
-        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
-    return {"ok": True}
+@app.delete("/groups/{group_id}", status_code=204)
+def delete_group(
+    group_id: int,
+    db: Session = Depends(get_db),
+    me: User = Depends(current_user),
+):
+    group = db.get(Group, group_id)
+    if not group:
+        raise HTTPException(404, "Group not found")
+    if group.owner_id != me.id:
+        raise HTTPException(403, "Only the owner can delete the group")
+
+    db.execute(
+        group_members.delete().where(group_members.c.group_id == group_id)
+    )
+    db.delete(group)
+    db.commit()
+    return Response(status_code=204)
+
+
+# ============================================================
+#  FAVICON (żeby nie spamować 404)
+# ============================================================
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
+
+# ============================================================
+#  START
+# ============================================================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

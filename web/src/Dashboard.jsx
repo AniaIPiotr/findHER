@@ -110,9 +110,13 @@ export default function Dashboard({
           </div>
           <h3>Groups</h3>
           <p>Join circles built around your interests and meet new people.</p>
-          <button className="dashboard-card-cta" type="button">
-            See groups
-          </button>
+<button
+  className="dashboard-card-cta"
+  type="button"
+  onClick={() => onNavigate?.("groups")}
+>
+  See groups
+</button>
         </article>
         <article className="dashboard-card">
           <div className="dashboard-card-icon">

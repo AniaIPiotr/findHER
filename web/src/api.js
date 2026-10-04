@@ -35,4 +35,27 @@ export const usersApi = {
     apiFetch("/add-User", { method: "POST", body: JSON.stringify(payload) }),
 };
 
+export const groupsApi = {
+  list: () => fetch("/groups", { credentials: "include" }),
+  create: (payload) =>
+    fetch("/groups", {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  get: (id) => fetch(`/groups/${id}`, { credentials: "include" }),
+  invite: (id, email) =>
+    fetch(`/groups/${id}/invite`, {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    }),
+  accept: (id) =>
+    fetch(`/groups/${id}/accept`, { method: "POST", credentials: "include" }),
+  leave: (id) =>
+    fetch(`/groups/${id}/leave`, { method: "DELETE", credentials: "include" }),
+};
+
 export const createUser = usersApi.create;
