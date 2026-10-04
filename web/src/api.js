@@ -1,4 +1,6 @@
-const API_BASE = "http://localhost:8000";
+// api.js
+const API_BASE =
+  (import.meta.env && import.meta.env.VITE_API_URL) || "http://localhost:8000";
 
 async function rawFetch(path, options = {}) {
   return fetch(`${API_BASE}${path}`, {
@@ -8,12 +10,26 @@ async function rawFetch(path, options = {}) {
   });
 }
 
-// Automatyczne odświeżenie sesji przy 401 (raz).
+// Single-flight refresh: równoległe 401 NIE mogą odpalać wielu refreshy
+// (inaczej backend wykrywa reuse i unieważnia całą sesję).
+let refreshPromise = null;
+
+async function ensureRefresh() {
+  if (!refreshPromise) {
+    refreshPromise = rawFetch("/auth/refresh", { method: "POST" })
+      .catch(() => null)
+      .finally(() => {
+        refreshPromise = null;
+      });
+  }
+  return refreshPromise;
+}
+
 export async function apiFetch(path, options = {}) {
   let res = await rawFetch(path, options);
   if (res.status === 401 && !path.startsWith("/auth/")) {
-    const refresh = await rawFetch("/auth/refresh", { method: "POST" });
-    if (refresh.ok) {
+    const refresh = await ensureRefresh();
+    if (refresh && refresh.ok) {
       res = await rawFetch(path, options);
     }
   }
@@ -33,29 +49,23 @@ export const authApi = {
 export const usersApi = {
   create: (payload) =>
     apiFetch("/add-User", { method: "POST", body: JSON.stringify(payload) }),
+  list: () => apiFetch("/Users"),
+  get: (id) => apiFetch(`/Users/${id}`),
 };
 
 export const groupsApi = {
-  list: () => fetch("/groups", { credentials: "include" }),
+  list: () => apiFetch("/groups"),
   create: (payload) =>
-    fetch("/groups", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    }),
-  get: (id) => fetch(`/groups/${id}`, { credentials: "include" }),
+    apiFetch("/groups", { method: "POST", body: JSON.stringify(payload) }),
+  get: (id) => apiFetch(`/groups/${id}`),
   invite: (id, email) =>
-    fetch(`/groups/${id}/invite`, {
+    apiFetch(`/groups/${id}/invite`, {
       method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email }),
     }),
-  accept: (id) =>
-    fetch(`/groups/${id}/accept`, { method: "POST", credentials: "include" }),
-  leave: (id) =>
-    fetch(`/groups/${id}/leave`, { method: "DELETE", credentials: "include" }),
+  accept: (id) => apiFetch(`/groups/${id}/accept`, { method: "POST" }),
+  leave: (id) => apiFetch(`/groups/${id}/leave`, { method: "DELETE" }),
+  remove: (id) => apiFetch(`/groups/${id}`, { method: "DELETE" }),
 };
 
 export const createUser = usersApi.create;

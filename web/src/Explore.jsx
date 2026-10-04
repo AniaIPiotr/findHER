@@ -12,10 +12,8 @@ import {
   Check,
   Plus,
 } from "lucide-react";
+import { usersApi } from "./api";
 import "./Explore.css";
-
-// Endpoint z listą userów – zmień, jeśli masz inny
-const USERS_ENDPOINT = "http://localhost:8000/Users";
 
 // Opcje filtrów
 const CITIES = ["Warsaw", "Kraków", "Wrocław", "Gdańsk", "Poznań", "Łódź"];
@@ -74,7 +72,7 @@ export default function Explore({ user, onBack, onSignOut }) {
   const [customInterest, setCustomInterest] = useState("");
 
   /* ============================================================
-     Pobierz profile z backendu
+     Pobierz profile z backendu (wymaga sesji, zwraca dane publiczne)
      ============================================================ */
   useEffect(() => {
     let cancelled = false;
@@ -83,29 +81,31 @@ export default function Explore({ user, onBack, onSignOut }) {
       setLoading(true);
       setLoadError("");
       try {
-        const res = await fetch(USERS_ENDPOINT);
+        const res = await usersApi.list();
+        if (res.status === 401) {
+          // Sesja padła i refresh też — wyślij usera do wylogowania.
+          if (!cancelled) {
+            setLoadError("Your session expired. Please sign in again.");
+          }
+          return;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
         const data = await res.json();
 
         // Wywal aktualnie zalogowanego usera, żeby nie pokazywać siebie
         const myId = user?.id ?? user?.user_id ?? null;
-        const myEmail = norm(user?.email);
 
         const list = (Array.isArray(data) ? data : [])
-          .filter((p) => {
-            if (myId != null && p.id === myId) return false;
-            if (myEmail && norm(p.email) === myEmail) return false;
-            return true;
-          })
+          .filter((p) => !(myId != null && p.id === myId))
           .map((p) => ({
             id: p.id,
             name: p.name || "Anonymous",
             surname: p.surname || "",
             age: p.age ?? 0,
             city: p.city || "Unknown",
-            email: p.email || "",
+            // Backend nie zwraca już emaila w widoku publicznym.
             interests: Array.isArray(p.interests) ? p.interests : [],
-            // Opcjonalne – jeśli backend zwraca, użyjemy; w przeciwnym razie fallback
             bio: p.bio || "",
             picture: p.picture || p.avatar || "",
             distanceKm: p.distanceKm ?? null,
@@ -123,15 +123,12 @@ export default function Explore({ user, onBack, onSignOut }) {
     return () => {
       cancelled = true;
     };
-  }, [user?.id, user?.email]);
+  }, [user?.id]);
 
   /* ============================================================
      Listy do panelu filtrów
      ============================================================ */
-  const allCities = useMemo(
-    () => [...CITIES, ...extraCities],
-    [extraCities],
-  );
+  const allCities = useMemo(() => [...CITIES, ...extraCities], [extraCities]);
 
   const allInterests = useMemo(
     () => [...PREDEFINED_INTERESTS, ...extraInterests],
@@ -146,13 +143,11 @@ export default function Explore({ user, onBack, onSignOut }) {
     const wantedInterests = filters.interests.map(norm);
 
     return profiles.filter((p) => {
-      // City – case-insensitive + partial (żeby "wa" złapało "Warsaw" i "Wa")
+      // City – case-insensitive + partial
       if (wantedCity) {
         const c = norm(p.city);
         const ok =
-          c === wantedCity ||
-          c.includes(wantedCity) ||
-          wantedCity.includes(c);
+          c === wantedCity || c.includes(wantedCity) || wantedCity.includes(c);
         if (!ok) return false;
       }
 
@@ -376,9 +371,7 @@ export default function Explore({ user, onBack, onSignOut }) {
                   {current.interests.map((tag) => (
                     <span
                       className={`explore-tag${
-                        filters.interests
-                          .map(norm)
-                          .includes(norm(tag))
+                        filters.interests.map(norm).includes(norm(tag))
                           ? " explore-tag--match"
                           : ""
                       }`}
@@ -399,7 +392,7 @@ export default function Explore({ user, onBack, onSignOut }) {
           <button
             type="button"
             className="explore-btn explore-btn--pass"
-            onClick={() => handleAction("pass")}
+            onClick={() => setIndex((i) => i + 1)}
             aria-label="Pass"
           >
             <X size={26} />
