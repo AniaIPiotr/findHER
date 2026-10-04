@@ -1098,7 +1098,20 @@ a:focus-visible {
   font-size: 0.9rem;
   line-height: 1.5;
   outline: none;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    background 0.15s ease;
+}
+.fields-row .field-full {
+  grid-column: 1 / -1; /* rozciąga na wszystkie kolumny gridu */
+}
+.fields-row > div:has(> textarea[name="bio"]) {
+  grid-column: 1 / -1;
+}
+
+.fields-row .field-full textarea {
+  width: 100%;
+  display: block;
 }
 
 .fields-row textarea:focus {
