@@ -618,10 +618,7 @@ function App() {
 
                 <div className="fields-row">
                   <div>
-                    <span>
-                      Bio
-                      <em className="optional-badge">optional</em>
-                    </span>
+                    <span>Bio</span>
                     <textarea
                       name="bio"
                       value={form.bio}
