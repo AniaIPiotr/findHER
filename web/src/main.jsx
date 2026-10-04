@@ -15,7 +15,7 @@ const GOOGLE_CONFIGURED =
   GOOGLE_CLIENT_ID.endsWith(".apps.googleusercontent.com");
 
 const PREDEFINED_INTERESTS = [
-"cybersecurity",
+  "cybersecurity",
   "programming",
   "data science/AI/ML",
   "robotics",
@@ -70,9 +70,10 @@ function App() {
   const [form, setForm] = useState({
     firstName: "",
     lastName: "",
-    city: "",
     email: "",
     age: "",
+    city: "",
+    bio: "",            // ← nowe
     interest: "",
   });
   const [interests, setInterests] = useState([]);
@@ -137,6 +138,8 @@ function App() {
               firstName: data.user.name || "",
               lastName: data.user.surname || "",
               age: data.user.age != null ? String(data.user.age) : "",
+              city: data.user.city || "",
+              bio: data.user.bio || "",          // ← nowe
             }));
           }
           if (Array.isArray(data.user.interests)) {
@@ -188,6 +191,8 @@ function App() {
         firstName: me.user.name || prev.firstName,
         lastName: me.user.surname || prev.lastName,
         age: me.user.age != null ? String(me.user.age) : prev.age,
+        city: me.user.city || prev.city,
+        bio: me.user.bio || prev.bio,        // ← nowe
       }));
       if (Array.isArray(me.user.interests) && me.user.interests.length) {
         setInterests(me.user.interests);
@@ -214,9 +219,10 @@ function App() {
     setForm({
       firstName: "",
       lastName: "",
-      city: "",
       email: "",
       age: "",
+      city: "",
+      bio: "",
       interest: "",
     });
     setInterests([]);
@@ -318,51 +324,66 @@ function App() {
   /* ============================================================
      SUBMIT
      ============================================================ */
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    if (!googleUser) {
-      setError("Please sign in with Google first.");
-      return;
+const handleSubmit = async (e) => {
+  e.preventDefault();
+  if (!googleUser) {
+    setError("Please sign in with Google first.");
+    return;
+  }
+  if (submitting) return;
+
+  const nameRegex = /^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż ]+$/;
+
+  if (!form.firstName.trim())
+    return setError("Please enter your first name.");
+  if (!nameRegex.test(form.firstName.trim()))
+    return setError("First name can only contain letters.");
+  if (!form.lastName.trim()) return setError("Please enter your last name.");
+  if (!nameRegex.test(form.lastName.trim()))
+    return setError("Last name can only contain letters.");
+
+  const age = Number(form.age);
+  if (!Number.isInteger(age) || age < 18 || age > 120) {
+    return setError("You must be at least 18 years old to join.");
+  }
+
+  if (!form.city.trim()) return setError("Please enter your city.");
+
+  // Bio – opcjonalne, ale jeśli jest, to z sensowną długością
+  const bio = form.bio.trim();
+  if (bio && bio.length < 10) {
+    return setError("Bio should be at least 10 characters.");
+  }
+  if (bio.length > 300) {
+    return setError("Bio can be up to 300 characters.");
+  }
+
+  if (!interests.length) {
+    return setError("Add at least one interest.");
+  }
+
+  setError("");
+  setSubmitted(false);
+  setSubmitting(true);
+
+  try {
+    const payload = {
+      name: form.firstName.trim(),
+      surname: form.lastName.trim(),
+      age,
+      city: form.city.trim(),
+      bio,                                // ← nowe
+      interests,
+    };
+
+    const res = await createUser(payload);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      const detail = Array.isArray(err.detail)
+        ? err.detail.map((d) => `${d.loc?.join(".")}: ${d.msg}`).join("; ")
+        : err.detail;
+      throw new Error(detail || "Something went wrong.");
     }
-    if (submitting) return;
-
-    const nameRegex = /^[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż ]+$/;
-
-    if (!form.firstName.trim())
-      return setError("Please enter your first name.");
-    if (!nameRegex.test(form.firstName.trim()))
-      return setError("First name can only contain letters.");
-    if (!form.lastName.trim()) return setError("Please enter your last name.");
-    if (!nameRegex.test(form.lastName.trim()))
-      return setError("Last name can only contain letters.");
-    if (!form.city.trim()) return setError("Please enter your city.");
-
-    const age = Number(form.age);
-    if (!Number.isInteger(age) || age < 18 || age > 120) {
-      return setError("You must be at least 18 years old to join.");
-    }
-    if (!interests.length) {
-      return setError("Add at least one interest.");
-    }
-
-    setError("");
-    setSubmitted(false);
-    setSubmitting(true);
-
-    try {
-      const payload = {
-        name: form.firstName.trim(),
-        surname: form.lastName.trim(),
-        city: form.city.trim(),
-        age,
-        interests,
-      };
-
-      const res = await createUser(payload);
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.detail || "Something went wrong.");
-      }
 
       setSubmitted(true);
 
@@ -594,6 +615,26 @@ if (googleUser && profileCompleted) {
                     />
                   </label>
                 </div>
+
+                <div className="fields-row">
+  <div>
+    <span>
+      Bio
+      <em className="optional-badge">optional</em>
+    </span>
+    <textarea
+      name="bio"
+      value={form.bio}
+      onChange={updateField}
+      placeholder="A few words about you — what you're into, what you're looking for…"
+      rows={4}
+      maxLength={300}
+    />
+    <small className="char-counter">
+      {form.bio.length}/300
+    </small>
+  </div>
+</div>
 
                 <div className="interests">
                   <label>

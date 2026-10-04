@@ -20,27 +20,31 @@ const USERS_ENDPOINT = "http://localhost:8000/Users";
 // Opcje filtrów
 const CITIES = ["Warsaw", "Kraków", "Wrocław", "Gdańsk", "Poznań", "Łódź"];
 
-const INTEREST_OPTIONS = [
-  "yoga",
+const PREDEFINED_INTERESTS = [
+  "cybersecurity",
+  "programming",
+  "data science/AI/ML",
+  "robotics",
+  "web dev",
+  "mobile dev",
+  "databases",
+  "networks",
+  "electronics",
+  "embedded",
+  "biotechnology",
+  "chemistry",
+  "physics",
+  "mathematics",
+  "statistics",
+  "astronomy",
+  "geology",
+  "design",
   "travel",
   "art",
   "music",
-  "coffee",
   "books",
-  "hiking",
-  "cooking",
-  "photography",
-  "dancing",
-  "fitness",
-  "wine",
-  "brunch",
   "movies",
   "gaming",
-  "fashion",
-  "meditation",
-  "running",
-  "painting",
-  "tech",
 ];
 
 const DEFAULT_FILTERS = {
@@ -131,7 +135,7 @@ export default function Explore({ user, onBack, onSignOut }) {
   );
 
   const allInterests = useMemo(
-    () => [...INTEREST_OPTIONS, ...extraInterests],
+    () => [...PREDEFINED_INTERESTS, ...extraInterests],
     [extraInterests],
   );
 

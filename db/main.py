@@ -56,6 +56,7 @@ def init_db():
                 email TEXT UNIQUE NOT NULL,
                 age INTEGER,
                 interests JSON,
+                bio TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -95,6 +96,7 @@ class ProfileIn(BaseModel):
     city: str
     age: int
     interests: list[str]
+    bio: str
 
 
 class UserOut(BaseModel):
@@ -105,6 +107,7 @@ class UserOut(BaseModel):
     email: str
     age: int | None = None
     interests: list[str] = []
+    bio: str
 
     @field_validator("interests", mode="before")
     @classmethod
@@ -299,7 +302,7 @@ def auth_me(request: Request):
     user_id = int(user["sub"])
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT id, email, name, surname, city, age, interests FROM users WHERE id = ?",
+            "SELECT id, email, name, surname, city, age, interests, bio FROM users WHERE id = ?",
             (user_id,),
         ).fetchone()
     if row is None:
@@ -320,8 +323,8 @@ def add_user(p: ProfileIn, request: Request):
 
     with get_conn() as conn:
         cur = conn.execute(
-            "UPDATE users SET name=?, surname=?, city=?, age=?, interests=? WHERE id=?",
-            (p.name, p.surname, p.city, p.age, json.dumps(p.interests), user_id),
+            "UPDATE users SET name=?, surname=?, city=?, age=?, interests=?, bio=? WHERE id=?",
+            (p.name, p.surname, p.city, p.age, json.dumps(p.interests), p.bio, user_id),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "User not found")
