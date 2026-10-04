@@ -1,34 +1,23 @@
 # main.py
 # ============================================================
-#  findHER — backend (FastAPI + SQLite + SQLAlchemy)
+#  findHER — backend (FastAPI + SQLite, raw sqlite3)
 # ============================================================
+import hashlib
+import json
 import os
-from datetime import datetime, timedelta
+import secrets
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from google.auth.transport import requests as google_requests
-from google.oauth2 import id_token as google_id_token
-from pydantic import BaseModel, EmailStr
-from sqlalchemy import (
-    Boolean,
-    Column,
-    DateTime,
-    ForeignKey,
-    Integer,
-    String,
-    Table,
-    Text,
-    create_engine,
-    func,
-    select,
-)
-from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
+from google.oauth2 import id_token
+from jose import JWTError, jwt
+from pydantic import BaseModel, EmailStr, field_validator
 
-# ============================================================
-#  KONFIGURACJA
-# ============================================================
+# ---------- KONFIG ----------
 GOOGLE_CLIENT_ID = os.getenv(
     "GOOGLE_CLIENT_ID",
     "4201094175-6m5g8qthid8hrnq6broebfq2ek699n0j.apps.googleusercontent.com",
@@ -41,7 +30,7 @@ IS_PROD = os.getenv("ENV", "dev") == "production"
 
 DB = "findher.db"
 
-app = FastAPI()
+app = FastAPI(title="findHER API")
 
 origins = ["https://mzums.com", "http://localhost:5173"]
 app.add_middleware(
@@ -76,13 +65,15 @@ def init_db():
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        # migracja dla istniejącej tabeli bez google_sub
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
         if "google_sub" not in cols:
             conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT")
+        if "bio" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN bio TEXT")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub)"
         )
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS refresh_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -128,10 +119,39 @@ def init_db():
             "CREATE INDEX IF NOT EXISTS idx_event_participants_user ON event_participants(user_id)"
         )
 
+        # ---------- GROUPS ----------
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                owner_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (owner_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'accepted',
+                invited_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (group_id, user_id),
+                FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id)"
+        )
+
 
 init_db()
 
-# ---------- MODELE ----------
+
+# ============================================================
+#  SCHEMATY PYDANTIC
+# ============================================================
 class GoogleAuthRequest(BaseModel):
     credential: str
 
@@ -139,32 +159,46 @@ class GoogleAuthRequest(BaseModel):
 class ProfileIn(BaseModel):
     name: str
     surname: str
+    city: str
     age: int
-    city: str = ""
-    bio: str = ""
     interests: List[str] = []
+    bio: str = ""
 
 
 class UserOut(BaseModel):
     id: int
+    name: Optional[str] = None
+    surname: Optional[str] = None
+    city: Optional[str] = None
     email: str
-    name: str
-    surname: str
     age: Optional[int] = None
-    city: str = ""
-    bio: str = ""
     interests: List[str] = []
-    profile_completed: bool = False
+    bio: Optional[str] = ""
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def parse_interests(cls, v):
+        if isinstance(v, str):
+            return json.loads(v or "[]")
+        return v or []
 
 
-class GoogleAuthIn(BaseModel):
-    credential: str
+class EventIn(BaseModel):
+    name: str
+    event_date: str
+    place: str
+    description: str = ""
+
+    @field_validator("name", "event_date", "place")
+    @classmethod
+    def not_blank(cls, v: str):
+        if not v or not v.strip():
+            raise ValueError("Field cannot be blank")
+        return v.strip()
 
 
 class GroupCreate(BaseModel):
     name: str
-    event_date: str  # ISO string, np. "2024-06-15T18:00"
-    place: str
     description: str = ""
 
 
@@ -174,8 +208,8 @@ class GroupInvite(BaseModel):
 
 class GroupMemberOut(BaseModel):
     id: int
-    name: str
-    surname: str
+    name: str = ""
+    surname: str = ""
     email: str
     city: str = ""
     bio: str = ""
@@ -187,198 +221,212 @@ class GroupMemberOut(BaseModel):
 class GroupOut(BaseModel):
     id: int
     name: str
-    description: str
+    description: str = ""
     owner_id: int
-    created_at: datetime
+    created_at: Optional[str] = None
     member_count: int
     members: List[GroupMemberOut] = []
 
 
 # ============================================================
-#  APP + CORS
+#  GOOGLE / TOKENY
 # ============================================================
-app = FastAPI(title="findHER API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ============================================================
-#  HELPERS: sesja / serializacja
-# ============================================================
-import json
-import secrets
+def verify_google_id_token(credential: str) -> dict:
+    try:
+        info = id_token.verify_oauth2_token(
+            credential, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError as e:
+        raise HTTPException(401, f"Invalid Google token: {e}")
+    if info.get("iss") not in ("accounts.google.com", "https://accounts.google.com"):
+        raise HTTPException(401, "Wrong issuer")
+    if not info.get("email_verified"):
+        raise HTTPException(401, "Google email not verified")
+    return info
 
 
-def user_to_out(u: User) -> UserOut:
-    return UserOut(
-        id=u.id,
-        email=u.email,
-        name=u.name or "",
-        surname=u.surname or "",
-        age=u.age,
-        city=u.city or "",
-        bio=u.bio or "",
-        interests=u.interests_list(),
-        profile_completed=bool(u.profile_completed),
-    )
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
-def create_session(db: Session, user_id: int) -> str:
-    token = secrets.token_urlsafe(32)
-    expires = datetime.utcnow() + timedelta(days=SESSION_TTL_DAYS)
-    db.add(SessionToken(token=token, user_id=user_id, expires_at=expires))
-    db.commit()
+def create_access_token(user_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "iat": now,
+        "exp": now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+        "type": "access",
+    }
+    return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
+
+
+def issue_refresh_token(user_id: int) -> str:
+    token = secrets.token_urlsafe(48)
+    expires = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+            (user_id, hash_token(token), expires.isoformat()),
+        )
     return token
 
 
-def set_session_cookie(response: Response, token: str):
-    response.set_cookie(
-        key=SESSION_COOKIE,
-        value=token,
+def set_auth_cookies(response: Response, access: str, refresh: str):
+    common = dict(
         httponly=True,
-        samesite="lax",
-        secure=False,   # True na HTTPS w produkcji
-        max_age=SESSION_TTL_DAYS * 24 * 3600,
+        secure=IS_PROD,
+        samesite="strict" if IS_PROD else "lax",
         path="/",
+    )
+    response.set_cookie(
+        "access_token", access, max_age=ACCESS_TOKEN_EXPIRE_MINUTES * 60, **common
+    )
+    response.set_cookie(
+        "refresh_token", refresh, max_age=REFRESH_TOKEN_EXPIRE_DAYS * 86400, **common
     )
 
 
-def clear_session_cookie(response: Response):
-    response.delete_cookie(SESSION_COOKIE, path="/")
+def clear_auth_cookies(response: Response):
+    response.delete_cookie("access_token", path="/")
+    response.delete_cookie("refresh_token", path="/")
 
 
-def current_user(request: Request, db: Session = Depends(get_db)) -> User:
-    token = request.cookies.get(SESSION_COOKIE)
+def get_current_user_optional(request: Request) -> Optional[dict]:
+    token = request.cookies.get("access_token")
     if not token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
+        return None
+    try:
+        payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        return None
+    if payload.get("type") != "access":
+        return None
+    return payload
 
-    row = db.get(SessionToken, token)
-    if not row or row.expires_at < datetime.utcnow():
-        raise HTTPException(status_code=401, detail="Session expired")
 
-    user = db.get(User, row.user_id)
+def require_user(request: Request) -> dict:
+    user = get_current_user_optional(request)
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(401, "Not authenticated")
     return user
 
 
 # ============================================================
-#  AUTH: Google
+#  AUTH
 # ============================================================
 @app.post("/auth/google")
-def auth_google(
-    payload: GoogleAuthIn,
-    response: Response,
-    db: Session = Depends(get_db),
-):
-    try:
-        info = google_id_token.verify_oauth2_token(
-            payload.credential,
-            google_requests.Request(),
-            GOOGLE_CLIENT_ID,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
+def auth_google(payload: GoogleAuthRequest, response: Response):
+    info = verify_google_id_token(payload.credential)
+    google_sub = info["sub"]
+    email = info["email"]
 
-    email = info.get("email")
-    if not email:
-        raise HTTPException(status_code=400, detail="Google account has no email")
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE google_sub = ?", (google_sub,)
+        ).fetchone()
 
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
-    if not user:
-        user = User(
-            email=email,
-            name=info.get("given_name", "") or "",
-            surname=info.get("family_name", "") or "",
-            profile_completed=False,
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    else:
-        # aktualizuj avatar / imię z Google, jeśli się zmieniło
-        changed = False
-        if changed:
-            db.commit()
-            db.refresh(user)
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM users WHERE email = ?", (email,)
+            ).fetchone()
+            if row is None:
+                cur = conn.execute(
+                    "INSERT INTO users (google_sub, email) VALUES (?, ?)",
+                    (google_sub, email),
+                )
+                user_id = cur.lastrowid
+            else:
+                conn.execute(
+                    "UPDATE users SET google_sub = ? WHERE id = ?",
+                    (google_sub, row["id"]),
+                )
+                user_id = row["id"]
+        else:
+            user_id = row["id"]
 
-    token = create_session(db, user.id)
-    set_session_cookie(response, token)
-    return {"ok": True, "user": user_to_out(user).model_dump()}
+    access = create_access_token(user_id)
+    refresh = issue_refresh_token(user_id)
+    set_auth_cookies(response, access, refresh)
+    return {"ok": True, "user_id": user_id}
 
 
-@app.get("/auth/me")
-def auth_me(request: Request, db: Session = Depends(get_db)):
-    token = request.cookies.get(SESSION_COOKIE)
+@app.post("/auth/refresh")
+def auth_refresh(request: Request, response: Response):
+    token = request.cookies.get("refresh_token")
     if not token:
-        return {"authenticated": False, "user": None}
+        raise HTTPException(401, "No refresh token")
 
-    row = db.get(SessionToken, token)
-    if not row or row.expires_at < datetime.utcnow():
-        return {"authenticated": False, "user": None}
+    th = hash_token(token)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM refresh_tokens WHERE token_hash = ? AND revoked = 0",
+            (th,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(401, "Invalid refresh token")
 
-    user = db.get(User, row.user_id)
-    if not user:
-        return {"authenticated": False, "user": None}
+        expires_at = datetime.fromisoformat(row["expires_at"])
+        if expires_at < datetime.now(timezone.utc):
+            conn.execute(
+                "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
+            )
+            raise HTTPException(401, "Refresh token expired")
 
-    return {"authenticated": True, "user": user_to_out(user).model_dump()}
+        conn.execute(
+            "UPDATE refresh_tokens SET revoked = 1 WHERE id = ?", (row["id"],)
+        )
+        user_id = row["user_id"]
+        new_refresh = secrets.token_urlsafe(48)
+        new_expires = datetime.now(timezone.utc) + timedelta(
+            days=REFRESH_TOKEN_EXPIRE_DAYS
+        )
+        conn.execute(
+            "INSERT INTO refresh_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)",
+            (user_id, hash_token(new_refresh), new_expires.isoformat()),
+        )
+
+    access = create_access_token(user_id)
+    set_auth_cookies(response, access, new_refresh)
+    return {"ok": True}
 
 
 @app.post("/auth/logout")
-def auth_logout(response: Response, request: Request, db: Session = Depends(get_db)):
-    token = request.cookies.get(SESSION_COOKIE)
+def auth_logout(request: Request, response: Response):
+    token = request.cookies.get("refresh_token")
     if token:
-        row = db.get(SessionToken, token)
-        if row:
-            db.delete(row)
-            db.commit()
-    clear_session_cookie(response)
+        with get_conn() as conn:
+            conn.execute(
+                "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?",
+                (hash_token(token),),
+            )
+    clear_auth_cookies(response)
     return {"ok": True}
+
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    user = get_current_user_optional(request)
+    if not user:
+        return {"authenticated": False}
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT id, email, name, surname, city, age, interests, bio FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return {"authenticated": False}
+    r = dict(row)
+    r["interests"] = json.loads(r["interests"] or "[]")
+    r["profile_completed"] = bool(
+        r["name"] and r["surname"] and r["age"] is not None
+    )
+    return {"authenticated": True, "user": r}
 
 
 # ============================================================
 #  USERS
 # ============================================================
-@app.post("/add-User")
-def add_user(
-    payload: UserCreate,
-    db: Session = Depends(get_db),
-    me: User = Depends(current_user),
-):
-    name = payload.name.strip()
-    surname = payload.surname.strip()
-    city = (payload.city or "").strip()
-    bio = (payload.bio or "").strip()
-
-    if not name:
-        raise HTTPException(400, "Name is required")
-    if not surname:
-        raise HTTPException(400, "Surname is required")
-    if payload.age is None or payload.age < 18 or payload.age > 120:
-        raise HTTPException(400, "Age must be between 18 and 120")
-    if not city:
-        raise HTTPException(400, "City is required")
-
-    me.name = name
-    me.surname = surname
-    me.age = payload.age
-    me.city = city
-    me.bio = bio
-    me.interests = json.dumps(payload.interests or [])
-    me.profile_completed = True
-
-    db.commit()
-    db.refresh(me)
-    return user_to_out(me)
-
-
-# ---------- USERS ----------
 @app.post("/add-User", response_model=UserOut, status_code=201)
 def add_user(p: ProfileIn, request: Request):
     user = require_user(request)
@@ -387,7 +435,15 @@ def add_user(p: ProfileIn, request: Request):
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE users SET name=?, surname=?, city=?, age=?, interests=?, bio=? WHERE id=?",
-            (p.name, p.surname, p.city, p.age, json.dumps(p.interests), p.bio, user_id),
+            (
+                p.name,
+                p.surname,
+                p.city,
+                p.age,
+                json.dumps(p.interests),
+                p.bio,
+                user_id,
+            ),
         )
         if cur.rowcount == 0:
             raise HTTPException(404, "User not found")
@@ -398,11 +454,11 @@ def add_user(p: ProfileIn, request: Request):
     return r
 
 
-@app.get("/Users", response_model=list[UserOut])
+@app.get("/Users", response_model=List[UserOut])
 def list_users():
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM users WHERE name IS NOT NULL"
+            "SELECT * FROM users WHERE name IS NOT NULL AND name != ''"
         ).fetchall()
     out = []
     for row in rows:
@@ -415,7 +471,9 @@ def list_users():
 @app.get("/Users/{user_id}", response_model=UserOut)
 def get_user(user_id: int):
     with get_conn() as conn:
-        row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
     if row is None:
         raise HTTPException(404, "Not found")
     r = dict(row)
@@ -423,9 +481,35 @@ def get_user(user_id: int):
     return r
 
 
-# ---------- EVENTS ----------
-def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> dict:
+# ============================================================
+#  EVENTS
+# ============================================================
+def _serialize_event(conn, ev_row, current_user_id):
     ev = dict(ev_row)
+
+    count = conn.execute(
+        "SELECT COUNT(*) AS c FROM event_participants WHERE event_id = ?",
+        (ev["id"],),
+    ).fetchone()["c"]
+
+    is_creator = current_user_id is not None and ev["creator_id"] == current_user_id
+
+    is_joined = False
+    if current_user_id is not None:
+        row = conn.execute(
+            "SELECT 1 FROM event_participants WHERE event_id = ? AND user_id = ?",
+            (ev["id"], current_user_id),
+        ).fetchone()
+        is_joined = row is not None
+
+    ev["participant_count"] = count
+    ev["is_creator"] = is_creator
+    ev["is_joined"] = is_joined
+
+    if not is_joined:
+        ev["participants"] = []
+        return ev
+
     parts = conn.execute(
         """
         SELECT u.id, u.name, u.surname, u.email, u.city, ep.joined_at
@@ -436,14 +520,8 @@ def _serialize_event(conn, ev_row: sqlite3.Row, current_user_id: int | None) -> 
         """,
         (ev["id"], ev["creator_id"]),
     ).fetchall()
-    participants = [dict(p) for p in parts]
-    ev["participants"] = participants
-    ev["participant_count"] = len(participants)
-    ev["is_creator"] = current_user_id is not None and ev["creator_id"] == current_user_id
-    ev["is_joined"] = (
-        current_user_id is not None
-        and any(p["id"] == current_user_id for p in participants)
-    )
+
+    ev["participants"] = [dict(p) for p in parts]
     return ev
 
 
@@ -458,7 +536,6 @@ def create_event(p: EventIn, request: Request):
             (user_id, p.name, p.event_date, p.place, p.description),
         )
         event_id = cur.lastrowid
-        # twórca automatycznie jest uczestnikiem
         conn.execute(
             "INSERT INTO event_participants (event_id, user_id) VALUES (?, ?)",
             (event_id, user_id),
@@ -466,73 +543,38 @@ def create_event(p: EventIn, request: Request):
     return {"ok": True, "id": event_id}
 
 
-@app.get("/groups/{group_id}", response_model=GroupOut)
-def get_group(
-    group_id: int,
-    db: Session = Depends(get_db),
-    me: User = Depends(current_user),
-):
-    group = db.get(Group, group_id)
-    if not group:
-        raise HTTPException(404, "Group not found")
-
-    row = db.execute(
-        select(group_members.c.status)
-        .where(group_members.c.group_id == group_id)
-        .where(group_members.c.user_id == me.id)
-    ).first()
-
-    if not row:
-        raise HTTPException(403, "You are not a member of this group")
-
-    return _serialize_group(group, db)
+@app.get("/events")
+def list_events(request: Request):
+    user = get_current_user_optional(request)
+    user_id = int(user["sub"]) if user else None
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM events ORDER BY event_date ASC, id ASC"
+        ).fetchall()
+        return [_serialize_event(conn, r, user_id) for r in rows]
 
 
-@app.post("/groups/{group_id}/invite", response_model=GroupOut)
-def invite_member(
-    group_id: int,
-    payload: GroupInvite,
-    db: Session = Depends(get_db),
-    me: User = Depends(current_user),
-):
-    group = db.get(Group, group_id)
-    if not group:
-        raise HTTPException(404, "Group not found")
-    if group.owner_id != me.id:
-        raise HTTPException(403, "Only the group owner can invite members")
-
-    invited = db.execute(
-        select(User).where(User.email == payload.email)
-    ).scalar_one_or_none()
-    if not invited:
-        raise HTTPException(404, "No user with that email")
-
-    existing = db.execute(
-        select(group_members.c.status)
-        .where(group_members.c.group_id == group_id)
-        .where(group_members.c.user_id == invited.id)
-    ).first()
-
-    if existing:
-        raise HTTPException(400, "User is already a member or already invited")
-
-    db.execute(
-        group_members.insert().values(
-            group_id=group_id, user_id=invited.id, status="invited"
-        )
-    )
-    db.commit()
-    db.refresh(group)
-    return _serialize_group(group, db)
+@app.get("/events/{event_id}")
+def get_event(event_id: int, request: Request):
+    user = get_current_user_optional(request)
+    user_id = int(user["sub"]) if user else None
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Event not found")
+        return _serialize_event(conn, row, user_id)
 
 
 @app.get("/events/{event_id}/participants")
 def get_event_participants(event_id: int, request: Request):
-    """Twardy endpoint: lista uczestników tylko dla członków/hostów."""
     user = require_user(request)
     user_id = int(user["sub"])
     with get_conn() as conn:
-        ev = conn.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        ev = conn.execute(
+            "SELECT * FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
         if ev is None:
             raise HTTPException(404, "Event not found")
 
@@ -562,7 +604,9 @@ def join_event(event_id: int, request: Request):
     user = require_user(request)
     user_id = int(user["sub"])
     with get_conn() as conn:
-        ev = conn.execute("SELECT id FROM events WHERE id = ?", (event_id,)).fetchone()
+        ev = conn.execute(
+            "SELECT id FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
         if ev is None:
             raise HTTPException(404, "Event not found")
         try:
@@ -571,71 +615,260 @@ def join_event(event_id: int, request: Request):
                 (event_id, user_id),
             )
         except sqlite3.IntegrityError:
-            pass  # już dołączył
+            pass
     return {"ok": True}
 
 
-@app.post("/groups/{group_id}/decline", status_code=204)
-def decline_invite(
-    group_id: int,
-    db: Session = Depends(get_db),
-    me: User = Depends(current_user),
-):
-    db.execute(
-        group_members.delete()
-        .where(group_members.c.group_id == group_id)
-        .where(group_members.c.user_id == me.id)
-        .where(group_members.c.status == "invited")
+@app.delete("/events/{event_id}/leave")
+def leave_event(event_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        ev = conn.execute(
+            "SELECT * FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Event not found")
+        if ev["creator_id"] == user_id:
+            raise HTTPException(400, "Creator cannot leave; delete the event instead")
+        conn.execute(
+            "DELETE FROM event_participants WHERE event_id = ? AND user_id = ?",
+            (event_id, user_id),
+        )
+    return {"ok": True}
+
+
+@app.delete("/events/{event_id}")
+def delete_event(event_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        ev = conn.execute(
+            "SELECT * FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if ev is None:
+            raise HTTPException(404, "Event not found")
+        if ev["creator_id"] != user_id:
+            raise HTTPException(403, "Only the creator can delete this event")
+        conn.execute("DELETE FROM events WHERE id = ?", (event_id,))
+    return {"ok": True}
+
+
+# ============================================================
+#  GROUPS
+# ============================================================
+def _serialize_group(conn, group_row, current_user_id):
+    group = dict(group_row)
+
+    rows = conn.execute(
+        """
+        SELECT u.id, u.name, u.surname, u.email, u.city, u.bio, u.age,
+               u.interests, gm.status
+        FROM group_members gm
+        JOIN users u ON u.id = gm.user_id
+        WHERE gm.group_id = ?
+        ORDER BY (u.id = ?) DESC, gm.invited_at ASC
+        """,
+        (group["id"], group["owner_id"]),
+    ).fetchall()
+
+    members: List[GroupMemberOut] = []
+    for r in rows:
+        md = dict(r)
+        md["interests"] = json.loads(md["interests"] or "[]")
+        md["name"] = md.get("name") or ""
+        md["surname"] = md.get("surname") or ""
+        md["city"] = md.get("city") or ""
+        md["bio"] = md.get("bio") or ""
+        md["age"] = md.get("age") or 0
+        md["status"] = "owner" if md["id"] == group["owner_id"] else md["status"]
+        members.append(GroupMemberOut(**md))
+
+    return GroupOut(
+        id=group["id"],
+        name=group["name"],
+        description=group["description"] or "",
+        owner_id=group["owner_id"],
+        created_at=group.get("created_at"),
+        member_count=len(members),
+        members=members,
     )
-    db.commit()
+
+
+@app.get("/groups", response_model=List[GroupOut])
+def list_my_groups(request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        rows = conn.execute(
+            """
+            SELECT g.* FROM groups g
+            JOIN group_members gm ON gm.group_id = g.id
+            WHERE gm.user_id = ?
+            ORDER BY g.created_at DESC, g.id DESC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [_serialize_group(conn, r, user_id) for r in rows]
+
+
+@app.post("/groups", response_model=GroupOut, status_code=201)
+def create_group(p: GroupCreate, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+
+    name = p.name.strip()
+    if not name:
+        raise HTTPException(400, "Group name is required")
+
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO groups (name, description, owner_id) VALUES (?, ?, ?)",
+            (name, (p.description or "").strip(), user_id),
+        )
+        gid = cur.lastrowid
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id, status) "
+            "VALUES (?, ?, 'accepted')",
+            (gid, user_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM groups WHERE id = ?", (gid,)
+        ).fetchone()
+        return _serialize_group(conn, row, user_id)
+
+
+@app.get("/groups/{group_id}", response_model=GroupOut)
+def get_group(group_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "Group not found")
+
+        member = conn.execute(
+            "SELECT status FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        ).fetchone()
+        if not member:
+            raise HTTPException(403, "You are not a member of this group")
+
+        return _serialize_group(conn, row, user_id)
+
+
+@app.post("/groups/{group_id}/invite", response_model=GroupOut)
+def invite_member(group_id: int, p: GroupInvite, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        group = conn.execute(
+            "SELECT * FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(404, "Group not found")
+        if group["owner_id"] != user_id:
+            raise HTTPException(403, "Only the group owner can invite members")
+
+        invited = conn.execute(
+            "SELECT * FROM users WHERE email = ?", (p.email,)
+        ).fetchone()
+        if invited is None:
+            raise HTTPException(404, "No user with that email")
+
+        existing = conn.execute(
+            "SELECT status FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, invited["id"]),
+        ).fetchone()
+        if existing:
+            raise HTTPException(400, "User is already a member or already invited")
+
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id, status) "
+            "VALUES (?, ?, 'invited')",
+            (group_id, invited["id"]),
+        )
+        return _serialize_group(conn, group, user_id)
+
+
+@app.post("/groups/{group_id}/accept", response_model=GroupOut)
+def accept_invite(group_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM group_members "
+            "WHERE group_id = ? AND user_id = ? AND status = 'invited'",
+            (group_id, user_id),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(404, "No pending invite")
+
+        conn.execute(
+            "UPDATE group_members SET status = 'accepted' "
+            "WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        )
+        group = conn.execute(
+            "SELECT * FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        return _serialize_group(conn, group, user_id)
+
+
+@app.post("/groups/{group_id}/decline", status_code=204)
+def decline_invite(group_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM group_members "
+            "WHERE group_id = ? AND user_id = ? AND status = 'invited'",
+            (group_id, user_id),
+        )
     return Response(status_code=204)
 
 
 @app.delete("/groups/{group_id}/leave", status_code=204)
-def leave_group(
-    group_id: int,
-    db: Session = Depends(get_db),
-    me: User = Depends(current_user),
-):
-    group = db.get(Group, group_id)
-    if not group:
-        raise HTTPException(404, "Group not found")
-    if group.owner_id == me.id:
-        raise HTTPException(
-            400, "Owner cannot leave — delete the group instead"
-        )
+def leave_group(group_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        group = conn.execute(
+            "SELECT * FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(404, "Group not found")
+        if group["owner_id"] == user_id:
+            raise HTTPException(400, "Owner cannot leave; delete the group instead")
 
-    db.execute(
-        group_members.delete()
-        .where(group_members.c.group_id == group_id)
-        .where(group_members.c.user_id == me.id)
-    )
-    db.commit()
+        conn.execute(
+            "DELETE FROM group_members WHERE group_id = ? AND user_id = ?",
+            (group_id, user_id),
+        )
     return Response(status_code=204)
 
 
 @app.delete("/groups/{group_id}", status_code=204)
-def delete_group(
-    group_id: int,
-    db: Session = Depends(get_db),
-    me: User = Depends(current_user),
-):
-    group = db.get(Group, group_id)
-    if not group:
-        raise HTTPException(404, "Group not found")
-    if group.owner_id != me.id:
-        raise HTTPException(403, "Only the owner can delete the group")
+def delete_group(group_id: int, request: Request):
+    user = require_user(request)
+    user_id = int(user["sub"])
+    with get_conn() as conn:
+        group = conn.execute(
+            "SELECT * FROM groups WHERE id = ?", (group_id,)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(404, "Group not found")
+        if group["owner_id"] != user_id:
+            raise HTTPException(403, "Only the owner can delete the group")
 
-    db.execute(
-        group_members.delete().where(group_members.c.group_id == group_id)
-    )
-    db.delete(group)
-    db.commit()
+        conn.execute("DELETE FROM groups WHERE id = ?", (group_id,))
     return Response(status_code=204)
 
 
 # ============================================================
-#  FAVICON (żeby nie spamować 404)
+#  FAVICON
 # ============================================================
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
